@@ -1,3 +1,4 @@
+from scod import distributions
 import torch
 from torch import nn
 from copy import deepcopy
@@ -60,13 +61,38 @@ class Projector(nn.Module):
         else:
             raise ValueError(proj_type +" is not an understood projection type.")
 
+    @torch.no_grad()
+    def compute_diag_var(self, J, n_eigs=None, eps=1):
+        """
+        given J, (d, N)
+        returns diagonal variance of J Sig J^T, where
+            Sig = ( 1/eps I + M U D U^T )^{-1}
+                = eps I - eps U (1/(Meps) D^{-1} + I)^{-1} U^T
+        """
+        basis = self.basis[:,-n_eigs:]
+        eigs = torch.clamp( self.eigs[-n_eigs:], min=0.)
+        
+        JJT = torch.sum(J**2, dim=-1)
+
+        scaling = eigs / (eigs + 1./ (eps))
+        neg_term = torch.sum(scaling[None,:]*(J @ basis)**2, dim=-1)
+        return eps*(JJT - neg_term) # shape (d,)
+
 base_config = {
     'num_samples': None, # sketch size T (T)
     'num_eigs': 10, # low rank estimate to recover (k)
     'weighted': False, # weight samples in sketch by loss
     'sketch_type': 'gaussian', # sketch type 
-    'curvature_type': 'fisher', # 'fisher' or 'sampled_ggn'
 }
+
+def dirichlet_expected_entropy(dist):
+    if not isinstance(dist, torch.distributions.Dirichlet):
+        return 0
+
+    alphas = dist.concentration
+    A = torch.sum(alphas, dim=-1)
+
+    return np.euler_gamma + torch.digamma(A) - torch.sum(alphas *( np.euler_gamma + torch.digamma(alphas)))/ A
 
 class SCOD(nn.Module):
     """
@@ -111,6 +137,9 @@ class SCOD(nn.Module):
             r=2*max(self.num_eigs + 2, (self.num_samples-1)//3),
             device=self.device
         )
+
+        self.eps = torch.ones(1, device=self.device) # prior variance
+        self.scaling_factor = torch.ones(1, device=self.device) # final scaling factor to rescale uncertainty output
         
     def process_dataset(self, dataset):
         """
@@ -129,7 +158,6 @@ class SCOD(nn.Module):
                                                  shuffle=True)
         
         sketch = self.sketch_class(N=self.n_params, 
-                                   M=len(dataloader),
                                    r=self.num_eigs,
                                    T=self.num_samples,
                                    device=self.device)
@@ -157,7 +185,6 @@ class SCOD(nn.Module):
             
         self.configured.data = torch.ones(1, dtype=torch.bool)
 
-        self.scaling_factor = torch.ones(1, device=self.device)
     
     def _get_weight_jacobian(self, vec):
         """
@@ -182,7 +209,7 @@ class SCOD(nn.Module):
                              for p in self.trainable_params]
                         )
     
-    def forward(self, inputs, n_eigs=None, proj_type="posterior_pred", Meps=5000):
+    def forward(self, inputs, n_eigs=None, proj_type="posterior_pred"):
         """
         assumes inputs are of shape (N, input_dims...)
         where N is the batch dimension,
@@ -202,24 +229,22 @@ class SCOD(nn.Module):
         N = inputs.shape[0]
         
         thetas = self.model(inputs)
-        dists = self.dist_constructor(thetas)
+        # dists = self.dist_constructor(thetas)
         unc = torch.zeros(N)
-        
-        # batch apply sqrt(I_th) to output
-        Lt_th = dists.apply_sqrt_F(thetas)
 
-        # compute uncertainty by backpropping back into each sample
         for j in range(N):
-            # dist = self.dist_constructor(thetas[j,:])
-            # Lt_th = dist.apply_sqrt_F(thetas[j,:])
-            Lt_J = self._get_weight_jacobian(Lt_th[j,:])    
-            unc[j] = self.projector.compute_distance(Lt_J.t(), proj_type, n_eigs=n_eigs, Meps=Meps) / self.scaling_factor
+            J = self._get_weight_jacobian(thetas[j,:])
+            dist = self.dist_constructor(thetas[j,:])
+            f_var = self.projector.compute_diag_var(J, n_eigs=n_eigs, eps=self.eps)
+            output_dist = dist.marginalize(f_var)
+            unc[j] = (output_dist.entropy()) / self.scaling_factor
 
         return thetas, unc
 
-    def calibrate(self, val_dataset, percentile=0.99):
+    def calibrate(self, val_dataset, percentile=0.99, calibrate_eps=False):
         """
-        evalutes the uncalibrated score on the val_dataset, and then selects a
+        evalutes the uncalibrated score on the val_dataset, 
+        and then selects a
         scaling factor such that percentile % of the dataset are below 1
         """
         scores = []

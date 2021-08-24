@@ -1,3 +1,4 @@
+from numpy.core.fromnumeric import var
 import torch
 from torch.distributions.transforms import AbsTransform
 from torch.functional import broadcast_shapes
@@ -38,6 +39,22 @@ class Bernoulli(distributions.Bernoulli):
             return L * vec
         else:
             return vec / L
+
+    def marginalize(self, diag_var):
+        """
+        returns an approximation to the marginal distribution if the parameter
+        used to initialize this distribution was distributed according to a Gaussian
+        with mean and a diagonal variance as given
+
+        inputs:
+            diag_var: variance of parameter (1,)
+        """
+        if self.use_logits:
+            kappa = 1. / torch.sqrt(1. + np.pi / 8 * diag_var)
+            p = torch.sigmoid(kappa * self.logits)
+        else:
+            p = self.probs # gaussian posterior in probability space is not useful
+        return distributions.Bernoulli(probs=p)
 
 class MultivariateNormal(distributions.multivariate_normal.MultivariateNormal):
     def __init__(self, loc, covariance_matrix=None, precision_matrix=None, scale_tril=None, validate_args=None):
@@ -89,7 +106,7 @@ class MultivariateNormal(distributions.multivariate_normal.MultivariateNormal):
         M = M_swap.transpose(-2,-1) # (b x c x n)
         M = M.transpose(-2,-3) # (c x b x n)
 
-        permuted_M = M.reshape(vec.shape[:-1] + [n]) # shape = (..., 1, j, i, 1, n)
+        permuted_M = M.reshape(vec.shape[:-1] + (n,)) # shape = (..., 1, j, i, 1, n)
         permute_inv_dims = list(range(outer_batch_dims))
         for i in range(bL_batch_dims):
             permute_inv_dims += [outer_batch_dims + i, old_batch_dims + i]
@@ -112,6 +129,18 @@ class Normal(distributions.normal.Normal):
 
         """
         return vec / self.stddev.detach()
+
+    def marginalize(self, diag_var):
+        """
+        returns an approximation to the marginal distribution if the parameter
+        used to initialize this distribution was distributed according to a Gaussian
+        with a diagonal variance as given
+
+        inputs:
+            diag_var: variance of parameter (d,)
+        """
+        stdev = torch.sqrt(self.variance + diag_var)
+        return distributions.Normal(loc=self.mean, scale=stdev)
 
 class Categorical(distributions.categorical.Categorical):
     def __init__(self, probs=None, logits=None, validate_args=None):
@@ -137,261 +166,28 @@ class Categorical(distributions.categorical.Categorical):
         else:
             return vec / (torch.sqrt(p) + 1e-8)
 
-# class DistFam(nn.Module):
-#     def loss(self, thetas, targets):
-#         """
-#         thetas (..., thetadim)
-#         targets (..., ydim)
-#         """
-#         return self._loss(thetas, targets)
-    
-#     def metric(self, outputs, targets):
-#         """
-#         return a user facing metric based on
-#         outputs = self.output(theta)
-        
-#         returns {'name':value}
-#         """
-#         return {}
-        
-#     def apply_sqrt_F(self, theta):
-#         """
-#         F(theta) = LL^T
+    def marginalize(self, diag_var):
+        """
+        returns an approximation to the marginal distribution if the parameter
+        used to initialize this distribution was distributed according to a Gaussian
+        with a diagonal variance as given
 
-#         returns y = L^T x
-#         """
-#         raise NotImplementedError
-        
-#     def output(self, theta):
-#         """
-#         turns theta into user-facing output
-#         """
-#         return theta
-    
-#     def uncertainty(self, outputs):
-#         """
-#         outputs: [..., outputdim]
-#         returns unc [...], uncertainty score per output
-#         """
-#         return 1. + 0.*outputs[...,0]
-        
-#     def merge_ensemble(self, thetas):
-#         return NotImplementedError
+        inputs:
+            diag_var: variance of parameter (d,)
+        """
+        if self.use_logits:
+            # probit approx
+            # kappa = 1. / torch.sqrt(1. + np.pi / 8 * diag_var)
+            # scaled_logits = kappa*self.logits
+            # dist = distributions.Categorical(logits=scaled_logits)
 
-# class GaussianFixedDiagVar(DistFam):
-#     """
-#     P(theta) = N(theta, diag(sigma))
-    
-#     Here, F(theta) = diag(sigma)^-1
-#     normalized F = diag(sigma)^(-1) / sum(sigma^-1)
-#     """
-#     def __init__(self, sigma_diag=np.array([1.]), min_val=-5, max_val=5):
-#         super().__init__()
-#         self.sigma_diag = nn.Parameter(torch.from_numpy(sigma_diag).float(), requires_grad=False)
-#         self.min_val=min_val
-#         self.max_val=max_val
-
-#     def dist(self, thetas):
-#         C = torch.diag_embed(torch.ones_like(thetas)*self.sigma_diag)
-#         return torch.distributions.MultivariateNormal(loc = thetas, covariance_matrix=C )
-        
-#     def loss(self, thetas, targets):
-#         err = targets - thetas
-#         return 0.5 * torch.sum( err**2 / self.sigma_diag, dim=-1 ) +0.5*err.shape[-1]*np.log(2*np.pi) + 0.5*torch.sum(torch.log(self.sigma_diag))
-
-#     @torch.no_grad()
-#     def metric(self, outputs, targets):
-#         err = outputs - targets
-#         return 'Mahalanobis Error', torch.sum(err**2 / self.sigma_diag, dim=-1)
-        
-#     def apply_sqrt_F(self, theta, exact=True):
-#         return theta / torch.sqrt( self.sigma_diag )
-    
-#     def apply_sqrt_G(self, theta, y):
-#         """
-#         returns S^T theta, where 
-#         $ \nabla^2_\theta log p (y \mid \theta) := S S^T
-#         """
-#         return theta / torch.sqrt( self.sigma_diag )
-
-#     def uncertainty(self, outputs):
-#         return torch.sum(self.sigma_diag) + 0*outputs[...,0]
-    
-#     def merge_ensemble(self, thetas):
-#         mu = torch.mean(thetas, dim=0)
-#         diag_var = torch.mean(thetas**2, dim=0) - mu**2
-#         unc = torch.sqrt(torch.sum(diag_var, dim=-1))
-#         return mu, unc
-    
-# class Bernoulli(DistFam):
-#     """
-#     theta \in \R^1
-#     P(theta) = Bern( theta )
-    
-#     Here, F(theta) = 1/(p(1-p))
-#     normalized F(theta) = 1
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self._loss = nn.BCELoss()
-    
-#     def dist(self, thetas):
-#         return torch.distributions.Bernoulli(probs = thetas)
-    
-    
-#     @torch.no_grad()
-#     def metric(self, outputs, targets):
-#         accuracy = (targets*(outputs > 0.5) + (1-targets)*(outputs < 0.5))[...,0]
-#         return 'Accuracy', accuracy
-        
-#     def apply_sqrt_F(self, theta):
-#         t = theta.detach()
-#         L = torch.sqrt( t*(1-t) ) + 1e-10 # for stability
-#         return theta / L
-    
-#     def merge_ensemble(self, thetas):
-#         mu = torch.mean(thetas, dim=0)
-#         unc = (- mu*torch.log(mu) - (1-mu)*torch.log(1-mu))[...,0]
-#         return mu, unc
-    
-# class BernoulliLogit(DistFam):
-#     """
-#     theta \in \R^1
-#     P(theta) = Bern( 1/(1 + exp(-theta)) )
-    
-#     Here, F(theta) = p(1-p)
-#     Normalize F(theta) = 1
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self._loss = nn.BCEWithLogitsLoss(reduction='none')
-        
-#     def dist(self, thetas):
-#         return torch.distributions.Bernoulli(logits = thetas)
-        
-#     @torch.no_grad()
-#     def metric(self, outputs, targets):
-#         accuracy = (targets*(outputs > 0.5) + (1-targets)*(outputs < 0.5))[...,0]
-#         return 'accuracy', accuracy
-# #         return '-log(p(y))', -torch.log(outputs[...,0])
-        
-#     def apply_sqrt_F(self, theta, exact=True):
-#         t = theta.detach()
-        
-#         p = torch.sigmoid(t)
-#         L = torch.sqrt(p*(1-p))
-#         return L*theta
-    
-#     def output(self, theta):
-#         return torch.sigmoid(theta)
-    
-#     def uncertainty(self, outputs):
-#         return (- outputs*torch.log(outputs) - (1-outputs)*torch.log(1-outputs))[...,0]
-    
-#     def merge_ensemble(self, thetas):
-#         ps = torch.sigmoid(thetas)
-#         mu = torch.mean(ps, dim=0)
-#         unc = (- mu*torch.log(mu) - (1-mu)*torch.log(1-mu))[...,0]
-#         if torch.isnan(unc):
-#             unc = torch.zeros_like(mu)[...,0]
-#         return mu, unc
-    
-# class Categorical(DistFam):
-#     """
-#     theta \in \R^k, 1^T theta = 1, theta > 0
-#     P(theta) = Categorical( p = theta )
-    
-#     Here, F(theta) = (diag(p^{-1})) = LL^T
-#     L = diag(p^{-1/2})
-#     normalized F = diag(p^{-1}) / sum(p^{-1})
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self.nll_loss = nn.NLLLoss(reduction='none')
-    
-#     def dist(self, thetas):
-#         return torch.distributions.Categorical(probs = thetas)
-        
-#     def loss(self, thetas, targets):
-#         return self.nll_loss(torch.log(thetas), targets)
-    
-#     @torch.no_grad()
-#     def metric(self, outputs, targets):
-# #         pred_label = torch.argmax(outputs, dim=-1)
-# #         accuracy = 1.*(targets == pred_label)
-# #         return 'Accuracy', accuracy
-#         prob_y = torch.gather(outputs,-1,targets[:,None])[...,0]
-#         return '-log(p(y))', -torch.log(prob_y)
-        
-#     def apply_sqrt_F(self, theta):
-#         t = theta.detach()
-#         L_diag = torch.sqrt(t) + 1e-7 # for stability
-#         return theta / L_diag 
-
-#     def uncertainty(self, outputs):
-#         return -torch.sum(outputs*torch.log(outputs), dim=-1)
-    
-#     def merge_ensemble(self, thetas):
-#         mu = torch.mean(thetas, dim=0)
-#         unc = -torch.sum(mu*torch.log(mu), dim=-1)
-#         return mu, unc
-    
-# class CategoricalLogit(DistFam):
-#     """
-#     theta \in \R^k
-#     P(theta) = Categorical( p = SoftMax(theta) )
-    
-#     Here, F(theta) = (diag(p) - pp^T) = LL^T
-#     L = (I - p1^T) diag(p^{1/2})
-#     L^T = diag(p^{1/2}) (I - 1p^T)
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self._loss = nn.CrossEntropyLoss(reduction='none')
-        
-#     def dist(self, thetas):
-#         return torch.distributions.Categorical(logits = thetas)
-    
-#     @torch.no_grad()
-#     def metric(self, outputs, targets):
-# #         pred_label = torch.argmax(outputs, dim=-1)
-# #         accuracy = 1.*(targets == pred_label)
-# #         return 'Accuracy', accuracy
-#         prob_y = torch.gather(outputs,-1,targets[:,None])[...,0]
-#         return '-log(p(y))', -torch.log(prob_y)
-        
-#     def apply_sqrt_F(self, theta, exact=True):
-#         t = theta.detach()
-        
-#         # exact computation
-#         if exact:
-#             p = torch.softmax(t, dim=-1)
-#             theta_bar = torch.sum(p*theta, dim=-1)[...,None]
-#             result = torch.sqrt(p)*(theta - theta_bar)
-        
-#         # or, just sample a couple outputs from p(y) and then compute gradients
-#         else:
-#             logp = torch.log_softmax(theta, dim=-1)
-#             vals, idx = logp.topk(min(5,logp.shape[-1]))
-#             result = -torch.exp(vals).detach()*torch.gather(logp,-1,idx)
-#         return result
-
-#     def apply_sqrt_G(self, theta, y):
-#         """
-#         returns S^T theta, where 
-#         $ \nabla^2_\theta log p (y \mid \theta) := S S^T
-#         """
-        
-#         return theta / torch.sqrt( self.sigma_diag )
-    
-#     def output(self, theta):
-#         return torch.softmax(theta, dim=-1)
-    
-#     def uncertainty(self, outputs):
-#         return -torch.sum(outputs*torch.log(outputs), dim=-1)
-    
-#     def merge_ensemble(self, thetas):
-#         ps = torch.softmax(thetas, dim=-1)
-#         mu = torch.mean(ps, dim=0)
-#         unc = -torch.sum(mu*torch.log(mu), dim=-1)
-#         return mu, unc
+            # laplace bridge
+            d = diag_var.shape[-1]
+            sum_exp = torch.sum(torch.exp(-self.logits), dim=-1, keepdim=True)
+            alpha = 1. / diag_var * (1 - 2./d + torch.exp(self.logits)/(d**2) * sum_exp)
+            dist = distributions.Dirichlet(alpha)
+            return distributions.Categorical(probs=torch.nan_to_num(dist.mean, nan=1.0))
+        else:
+            p = self.probs # gaussian posterior in probability space is not useful
+            return distributions.Categorical(probs=p)
+        return dist

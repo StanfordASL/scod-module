@@ -78,14 +78,12 @@ class SinglePassPCA():
     rank r range basis
     """
     def __init__(self, N, # A.shape[0]
-                       M, # A.shape[1]
                        r, # number of eigenvectors to collect
                        T=None, # total sketch dimension to use
                        sketch_op_class=GaussianSketchOp, # sketch operator to use
                        device=torch.device('cpu'), # device on which to create sketch 
                 ):
         self.N = N
-        self.M = M
         self.r = r
         self.T = T
         if T is None:
@@ -111,12 +109,12 @@ class SinglePassPCA():
     def low_rank_update(self, v, weight):
         """
         processes v (nparam x d) the a batch of columns of matrix A
-        self.Y += 1/M weight v v^T Om
-        self.W += 1/M weight Psi v v^T
+        self.Y += weight v v^T Om
+        self.W += weight Psi v v^T
         """
         v = v.to(self.device)
-        torch.addmm(self.Y, weight*v, self.Om(v.t(), transpose=True), alpha=1/self.M, out=self.Y)
-        torch.addmm(self.W, weight*self.Psi(v), v.t(), alpha=1/self.M, out=self.W)
+        torch.addmm(self.Y, weight*v, self.Om(v.t(), transpose=True), alpha=1, out=self.Y)
+        torch.addmm(self.W, weight*self.Psi(v), v.t(), alpha=1, out=self.W)
         
     @torch.no_grad()
     def eigs(self):
