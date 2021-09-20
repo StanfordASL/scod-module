@@ -2,6 +2,7 @@ from scod import distributions
 import torch
 from torch import nn
 from copy import deepcopy
+from torch.cuda.amp.autocast_mode import autocast
 
 from tqdm import tqdm
 from torch.autograd import grad
@@ -62,37 +63,43 @@ class Projector(nn.Module):
             raise ValueError(proj_type +" is not an understood projection type.")
 
     @torch.no_grad()
-    def compute_diag_var(self, J, n_eigs=None, eps=1):
+    def compute_diag_var(self, J, P=None, n_eigs=None, eps=1):
         """
         given J, (d, N)
-        returns diagonal variance of J Sig J^T, where
+        
+        if P is not given, assumes P is the identity matrix
+
+        returns diagonal variance of P J Sig J^T P^T, where
             Sig = ( 1/eps I + M U D U^T )^{-1}
                 = eps I - eps U (1/(Meps) D^{-1} + I)^{-1} U^T
         """
         basis = self.basis[:,-n_eigs:]
         eigs = torch.clamp( self.eigs[-n_eigs:], min=0.)
         
-        JJT = torch.sum(J**2, dim=-1)
+        print(J.shape, P.shape)
+
+
+        JJT = J @ J.T # torch.sum(J**2, dim=-1)
 
         scaling = eigs / (eigs + 1./ (eps))
-        neg_term = torch.sum(scaling[None,:]*(J @ basis)**2, dim=-1)
-        return eps*(JJT - neg_term) # shape (d,)
+        neg_term = torch.sqrt(scaling[None,:])*(J @ basis)
+        neg_term = neg_term @ neg_term.T
+        
+        if P is not None:
+            chol_sig = torch.linalg.cholesky(JJT - neg_term)
+            sig = torch.sum( (P @ chol_sig)**2, dim=-1)  #( P[:,None,:] @ ( (JJT - neg_term) @ P.T) )[:,0]
+            return eps*sig
+        
+        else: 
+            return torch.diagonal(eps*(JJT - neg_term)) # shape (d,d)
 
 base_config = {
     'num_samples': None, # sketch size T (T)
     'num_eigs': 10, # low rank estimate to recover (k)
-    'weighted': False, # weight samples in sketch by loss
+    'n_fisher_samples': None, # None -> use full Fisher; k -> project using random projection; 0 -> use y values in dataset
     'sketch_type': 'gaussian', # sketch type 
 }
 
-def dirichlet_expected_entropy(dist):
-    if not isinstance(dist, torch.distributions.Dirichlet):
-        return 0
-
-    alphas = dist.concentration
-    A = torch.sum(alphas, dim=-1)
-
-    return np.euler_gamma + torch.digamma(A) - torch.sum(alphas *( np.euler_gamma + torch.digamma(alphas)))/ A
 
 class SCOD(nn.Module):
     """
@@ -138,8 +145,10 @@ class SCOD(nn.Module):
             device=self.device
         )
 
-        self.eps = torch.ones(1, device=self.device) # prior variance
-        self.scaling_factor = torch.ones(1, device=self.device) # final scaling factor to rescale uncertainty output
+        self.eps = nn.Parameter(torch.ones(1, device=self.device), requires_grad=False) # prior variance
+        self.scaling_factor = nn.Parameter(torch.ones(1, device=self.device), requires_grad=False) # final scaling factor to rescale uncertainty output
+
+        self.output_dim = None
         
     def process_dataset(self, dataset):
         """
@@ -151,32 +160,59 @@ class SCOD(nn.Module):
         dataset - torch dataset of (input, target) pairs
         """
         # loop through data, one sample at a time
-        print("computing basis")
+        print("computing basis") 
             
         dataloader = torch.utils.data.DataLoader(dataset, 
                                                  batch_size=1, 
-                                                 shuffle=True)
+                                                 shuffle=True,
+                                                 num_workers=1,
+                                                 pin_memory=True)
         
         sketch = self.sketch_class(N=self.n_params, 
                                    r=self.num_eigs,
                                    T=self.num_samples,
                                    device=self.device)
-        
+
+
         n_data = len(dataloader)
         for i, (inputs,labels) in tqdm(enumerate(dataloader), total=n_data):
-            inputs = inputs.to(self.device)
-            labels = labels.to(self.device)
+            inputs = inputs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
 
-            thetas = self.model(inputs) # get params of output dist
-
-            dist = self.dist_constructor(thetas)
-            weight = 1.
+            with autocast():
+                thetas = self.model(inputs) # get params of output dist
             
-            Lt_th = dist.apply_sqrt_F(thetas).mean(dim=0) # L^\T theta
+                T = self.config["n_fisher_samples"]
+                if T is not None and T == 0:
+                    # hack for FCN training on VOC (label = 255 means ignore the pixel)
+                    thetas_flat = thetas.reshape(1,-1,thetas.shape[-1])
+                    labels_flat = labels.reshape(1,-1)
+                    valid_label_idx = torch.nonzero(torch.logical_and(labels  >= 0, labels < thetas.shape[-1]), as_tuple=True)[1]
+                    valid_thetas = thetas_flat[:,valid_label_idx,:]
+                    valid_labels = labels_flat[:,valid_label_idx]
+                    thetas = valid_thetas
+                    labels = valid_labels
+
+                    dist = self.dist_constructor(thetas)
+                    Lt_th = -dist.log_prob(labels)[None] # - log p(y | x)
+                else:
+                    dist = self.dist_constructor(thetas)
+                    Lt_th = dist.apply_sqrt_F(thetas).mean(dim=0) # L^\T theta
+                
+                # flatten
+                Lt_th = Lt_th.view(-1)
+                if T is not None and 0 < T < Lt_th.shape[-1]:
+                    # apply random proj
+                    P = torch.randn(T, Lt_th.shape[-1], device=self.device) / np.sqrt(T)
+                    Lt_th = Lt_th @ P.T
+
+            
             Lt_J = self._get_weight_jacobian(Lt_th) # L^\T J, J = dth / dw
-            sketch.low_rank_update(Lt_J.t(),weight) # add 1/M J^T L L^T J to the sketch
+            sketch.low_rank_update(Lt_J.t()) # add 1/M J^T L L^T J to the sketch
         
         del Lt_J
+
+        self.output_dim = thetas.shape[-1]
         
         eigs, eigvs = sketch.eigs()
         del sketch
@@ -209,7 +245,7 @@ class SCOD(nn.Module):
                              for p in self.trainable_params]
                         )
     
-    def forward(self, inputs, n_eigs=None, proj_type="posterior_pred"):
+    def forward(self, inputs, n_eigs=None, proj_type="posterior_pred", T=None):
         """
         assumes inputs are of shape (N, input_dims...)
         where N is the batch dimension,
@@ -225,20 +261,40 @@ class SCOD(nn.Module):
             
         if n_eigs is None:
             n_eigs = self.num_eigs
+
+        if T is not None and T == 0:
+            thetas = self.model(inputs)
+            dists = self.dist_constructor(thetas)
+            unc = dists.entropy()
+            return thetas, unc
             
         N = inputs.shape[0]
         
         thetas = self.model(inputs)
+        print(thetas.shape)
+        proj_thetas = thetas
+        if T is not None:
+            D = thetas.reshape(N,-1).shape[-1]
+            P = torch.randn(D, T)
+            P,_ = torch.linalg.qr(P, 'reduced')
+            P = P.to(self.device)
+            proj_thetas = thetas.reshape(N,-1) @ P
         # dists = self.dist_constructor(thetas)
-        unc = torch.zeros(N)
+        unc = []
 
         for j in range(N):
-            J = self._get_weight_jacobian(thetas[j,:])
-            dist = self.dist_constructor(thetas[j,:])
-            f_var = self.projector.compute_diag_var(J, n_eigs=n_eigs, eps=self.eps)
+            J = self._get_weight_jacobian(proj_thetas[j,...].view(-1))
+            dist = self.dist_constructor(thetas[j,...])
+            f_var = self.projector.compute_diag_var(J, P=P, n_eigs=n_eigs, eps=self.eps)
+            f_var = f_var.reshape(thetas[j,...].shape)
             output_dist = dist.marginalize(f_var)
-            unc[j] = (output_dist.entropy()) / self.scaling_factor
+            unc.append( (output_dist.entropy()) / self.scaling_factor )
 
+            # dist = self.dist_constructor(thetas[j,:])
+            # Lt_th = dist.apply_sqrt_F(thetas[j,:]) # L^\T theta
+            # Lt_J = self._get_weight_jacobian(Lt_th) # L^\T J, J = dth / dw
+            # unc[j] = self.projector.compute_distance(Lt_J.T, proj_type, n_eigs, self.eps) / self.scaling_factor
+        unc = torch.stack(unc)
         return thetas, unc
 
     def calibrate(self, val_dataset, percentile=0.99, calibrate_eps=False):

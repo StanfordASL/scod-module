@@ -106,7 +106,7 @@ class SinglePassPCA():
         super().__init__()
 
     @torch.no_grad()
-    def low_rank_update(self, v, weight):
+    def low_rank_update(self, v, weight=1.):
         """
         processes v (nparam x d) the a batch of columns of matrix A
         self.Y += weight v v^T Om
