@@ -1,5 +1,6 @@
 import torch
 from .sketch_ops import GaussianSketchOp, SRFTSketchOp
+from .ipca import IncrementalPCA as iPCA
 
 """
 Tools for extracting low-rank approximations from sketched matrices
@@ -140,11 +141,51 @@ class SRFT_SinglePassPCA(SinglePassPCA):
     then, uses eigen decomp of sketch to compute 
     rank r range basis
     """
-    def __init__(self, N, M, r, T=None, device=torch.device("cpu")):
-        super().__init__(N, M, r, T, device, sketch_op_class=SRFTSketchOp)
+    def __init__(self, N, r, T=None, device=torch.device("cpu")):
+        super().__init__(N, r, T, device=device, sketch_op_class=SRFTSketchOp)
 
+
+class IncrementalPCA(iPCA):
+    def __init__(self, N, r, T=None, batch_size=50, device=torch.device('cpu')):
+        super().__init__(feature_dim=N, n_components=r, device=device)
+        self.counter = 0
+        self.batch_size = batch_size
+        self.batch = []
+
+    @torch.no_grad()
+    def low_rank_update(self,v):
+        """
+        if v is a vector, then it is straightforward
+        
+        how to handle jacobian matrix?
+            J = \sum_j \sigma_j u_j v_j^T
+            if we want V L V^T -> \sum_i J_i^T J_i
+             -> \sum_i \sum_j v_j \sigma_{i,j} u_j^T u_j v_j^T
+             -> \sum_i \sum_j v_{i,j} \sigma_{i,j} v_{i,j}
+        
+        i.e., given v, compute u,s,vt = SVD(v)
+            then, treat s[:,None]*vt as a batch of inputs
+        """
+        self.batch.append(v.T)
+        self.counter += 1
+
+        if self.counter % self.batch_size == 0:
+            # evaluate batch
+            batch = torch.stack(self.batch)
+            self.batch = [] # reset for next batch
+
+            M,d,N = batch.shape
+            if d > 1:
+                U,s,Vt = torch.linalg.svd(batch, full_matrices=True)
+                batch = s[:,:,None]*Vt
+
+            self.forward(batch)
+
+    def eigs(self):
+        return self.counter*self.singular_vals**2, self.components.T
 
 alg_registry = {
     'gaussian': SinglePassPCA,
     'srft': SRFT_SinglePassPCA,
+    'iPCA': IncrementalPCA,
 }

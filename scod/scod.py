@@ -76,8 +76,6 @@ class Projector(nn.Module):
         basis = self.basis[:,-n_eigs:]
         eigs = torch.clamp( self.eigs[-n_eigs:], min=0.)
         
-        print(J.shape, P.shape)
-
 
         JJT = J @ J.T # torch.sum(J**2, dim=-1)
 
@@ -137,7 +135,8 @@ class SCOD(nn.Module):
             
         self.configured = nn.Parameter(torch.zeros(1, dtype=torch.bool), requires_grad=False)
         
-        self.sketch_class = alg_registry[self.config['sketch_type']]   
+        self.sketch_class = alg_registry[self.config['sketch_type']] 
+        print(self.sketch_class)
         
         self.projector = Projector(
             N=self.n_params,
@@ -165,7 +164,7 @@ class SCOD(nn.Module):
         dataloader = torch.utils.data.DataLoader(dataset, 
                                                  batch_size=1, 
                                                  shuffle=True,
-                                                 num_workers=1,
+                                                 num_workers=0,
                                                  pin_memory=True)
         
         sketch = self.sketch_class(N=self.n_params, 
@@ -216,7 +215,7 @@ class SCOD(nn.Module):
         
         eigs, eigvs = sketch.eigs()
         del sketch
-        
+
         self.projector.process_basis(eigs, eigvs)
             
         self.configured.data = torch.ones(1, dtype=torch.bool)
@@ -273,6 +272,7 @@ class SCOD(nn.Module):
         thetas = self.model(inputs)
         print(thetas.shape)
         proj_thetas = thetas
+        P = None
         if T is not None:
             D = thetas.reshape(N,-1).shape[-1]
             P = torch.randn(D, T)
@@ -319,5 +319,5 @@ class SCOD(nn.Module):
         scores = torch.cat(scores)
         value = torch.quantile(scores, percentile)
 
-        self.scaling_factor *= value
+        self.scaling_factor.data *= value
 
