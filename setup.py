@@ -1,5 +1,3 @@
-"""setup.py for hessian_eigenthings"""
-
 from setuptools import setup, find_packages
 
 install_requires = [
