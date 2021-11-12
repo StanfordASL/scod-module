@@ -36,7 +36,7 @@ class Projector(nn.Module):
         proj_L = basis @ proj_L
         return torch.norm(L - proj_L) 
     
-    def posterior_pred(self, L, n_eigs, Meps):
+    def posterior_pred(self, L, n_eigs, eps):
         """
         we have U = basis,
         computes ||(I-UU^T)L||^2_F
@@ -44,13 +44,13 @@ class Projector(nn.Module):
         basis = self.basis[:,-n_eigs:]
         eigs = torch.clamp( self.eigs[-n_eigs:], min=0.)
 
-        scaling = torch.sqrt( eigs / ( eigs + 1./(Meps) ) )
+        scaling = torch.sqrt( eigs / ( eigs + 1./(eps) ) )
         proj_L = scaling[:,None] * (basis.t() @ L)
 
         return torch.sqrt( torch.sum(L**2) - torch.sum(proj_L**2) )
     
     @torch.no_grad()
-    def compute_distance(self, L, proj_type, n_eigs=None, Meps=5000.):
+    def compute_distance(self, L, proj_type, n_eigs=None, eps=1.):
         if n_eigs is None:
             n_eigs = self.r
             
@@ -58,11 +58,10 @@ class Projector(nn.Module):
         if proj_type == 'ortho':
             return self.ortho_proj(L, n_eigs)
         elif proj_type == 'posterior_pred':
-            return self.posterior_pred(L, n_eigs, Meps)
+            return self.posterior_pred(L, n_eigs, eps)
         else:
             raise ValueError(proj_type +" is not an understood projection type.")
 
-    @torch.no_grad()
     def compute_diag_var(self, J, P=None, n_eigs=None, eps=1):
         """
         given J, (d, N)
@@ -96,6 +95,7 @@ base_config = {
     'num_eigs': 10, # low rank estimate to recover (k)
     'n_fisher_samples': None, # None -> use full Fisher; k -> project using random projection; 0 -> use y values in dataset
     'sketch_type': 'gaussian', # sketch type 
+    'unc_type': 'marginalized' # "marginalized" returns p(y|x) = \int p(y|z)p(z|x) dz, "KL" returns E[ KL(p( y|z) || p(y|zbar)) ]
 }
 
 
@@ -144,10 +144,15 @@ class SCOD(nn.Module):
             device=self.device
         )
 
-        self.eps = nn.Parameter(torch.ones(1, device=self.device), requires_grad=False) # prior variance
+        self.log_eps = nn.Parameter(torch.zeros(1, device=self.device), requires_grad=True) # prior variance
         self.scaling_factor = nn.Parameter(torch.ones(1, device=self.device), requires_grad=False) # final scaling factor to rescale uncertainty output
+        self.hyperparameters = [self.log_eps]
 
         self.output_dim = None
+
+    @property
+    def eps(self):
+        return torch.exp(self.log_eps)
         
     def process_dataset(self, dataset):
         """
@@ -270,7 +275,6 @@ class SCOD(nn.Module):
         N = inputs.shape[0]
         
         thetas = self.model(inputs)
-        print(thetas.shape)
         proj_thetas = thetas
         P = None
         if T is not None:
@@ -279,23 +283,21 @@ class SCOD(nn.Module):
             P,_ = torch.linalg.qr(P, 'reduced')
             P = P.to(self.device)
             proj_thetas = thetas.reshape(N,-1) @ P
-        # dists = self.dist_constructor(thetas)
+
         unc = []
+        dists = []
 
         for j in range(N):
-            J = self._get_weight_jacobian(proj_thetas[j,...].view(-1))
+            J = self._get_weight_jacobian(proj_thetas[j,...].view(-1)).detach()
             dist = self.dist_constructor(thetas[j,...])
             f_var = self.projector.compute_diag_var(J, P=P, n_eigs=n_eigs, eps=self.eps)
             f_var = f_var.reshape(thetas[j,...].shape)
             output_dist = dist.marginalize(f_var)
-            unc.append( (output_dist.entropy()) / self.scaling_factor )
+            dists.append(output_dist)
+            unc.append( (output_dist.entropy() / self.scaling_factor ).sum())
 
-            # dist = self.dist_constructor(thetas[j,:])
-            # Lt_th = dist.apply_sqrt_F(thetas[j,:]) # L^\T theta
-            # Lt_J = self._get_weight_jacobian(Lt_th) # L^\T J, J = dth / dw
-            # unc[j] = self.projector.compute_distance(Lt_J.T, proj_type, n_eigs, self.eps) / self.scaling_factor
         unc = torch.stack(unc)
-        return thetas, unc
+        return dists, unc
 
     def calibrate(self, val_dataset, percentile=0.99, calibrate_eps=False):
         """

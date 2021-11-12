@@ -11,8 +11,22 @@ from torch.distributions.multivariate_normal import _batch_mahalanobis
 this file implements different output distributional families, with their loss functions and Fisher matrices
 
 specifically, for each family, if F(theta) = LL^T
-we implement left multiplication by L^T by the function
+we implement left multiplication by L^T using the function
+
 apply_sqrt_F
+
+we also implement:
+
+marginalize(var): which returns the distribution if the parameters used to construct the original 
+    distribution were normally distributed with diagonal variance given by var
+
+merge_batch(): returns the distribution approximating the mixture distribution constructed by 
+    summing across the first batch dimension. useful if you construct this distribution with a batch
+    of parameters corresponding to MC samples, and you want a single distribution approximation of the mixture.
+
+metric(label): which returns a more human friendly measure of error between the distribution and the label
+    for Normal distributions, this is the MSE, while for discrete distributions, this yields the 0-1 error
+
 """
 
 class Bernoulli(distributions.Bernoulli):
@@ -55,6 +69,16 @@ class Bernoulli(distributions.Bernoulli):
         else:
             p = self.probs # gaussian posterior in probability space is not useful
         return distributions.Bernoulli(probs=p)
+
+    def merge_batch(self):
+        p_mean = self.probs.mean(dim=0)
+        return distributions.Bernoulli(probs=p_mean)
+
+    def metric(self, y):
+        """
+        classification error (1- accuracy)
+        """
+        return (torch.argmax(self.probs, dim=-1) != y).float()
 
 class MultivariateNormal(distributions.multivariate_normal.MultivariateNormal):
     def __init__(self, loc, covariance_matrix=None, precision_matrix=None, scale_tril=None, validate_args=None):
@@ -140,7 +164,14 @@ class Normal(distributions.normal.Normal):
             diag_var: variance of parameter (d,)
         """
         stdev = torch.sqrt(self.variance + diag_var)
-        return distributions.Normal(loc=self.mean, scale=stdev)
+        return Normal(loc=self.mean, scale=stdev)
+
+    def merge_batch(self):
+        diag_var = torch.mean(self.mean**2, dim=0) - self.mean.mean(dim=0)**2 + self.variance.mean(dim=0)
+        return Normal(loc=self.mean.mean(dim=0), scale=torch.sqrt(diag_var))
+
+    def metric(self, y):
+        return torch.mean( torch.sum( (y - self.mean)**2, dim=-1) )
 
 class Categorical(distributions.categorical.Categorical):
     def __init__(self, probs=None, logits=None, validate_args=None):
@@ -176,18 +207,29 @@ class Categorical(distributions.categorical.Categorical):
             diag_var: variance of parameter (d,)
         """
         if self.use_logits:
+            # @TODO: allow selecting this via an argument
             # probit approx
-            # kappa = 1. / torch.sqrt(1. + np.pi / 8 * diag_var)
-            # scaled_logits = kappa*self.logits
-            # dist = distributions.Categorical(logits=scaled_logits)
+            kappa = 1. / torch.sqrt(1. + np.pi / 8 * diag_var)
+            scaled_logits = kappa*self.logits
+            dist = Categorical(logits=scaled_logits)
 
             # laplace bridge
-            d = diag_var.shape[-1]
-            sum_exp = torch.sum(torch.exp(-self.logits), dim=-1, keepdim=True)
-            alpha = 1. / diag_var * (1 - 2./d + torch.exp(self.logits)/(d**2) * sum_exp)
-            dist = distributions.Dirichlet(alpha)
-            return distributions.Categorical(probs=torch.nan_to_num(dist.mean, nan=1.0))
+            # d = diag_var.shape[-1]
+            # sum_exp = torch.sum(torch.exp(-self.logits), dim=-1, keepdim=True)
+            # alpha = 1. / diag_var * (1 - 2./d + torch.exp(self.logits)/(d**2) * sum_exp)
+            # dist = distributions.Dirichlet(alpha)
+            # return distributions.Categorical(probs=torch.nan_to_num(dist.mean, nan=1.0))
         else:
             p = self.probs # gaussian posterior in probability space is not useful
-            return distributions.Categorical(probs=p)
+            return Categorical(probs=p)
         return dist
+
+    def merge_batch(self):
+        p_mean = self.probs.mean(dim=0)
+        return Categorical(probs=p_mean)
+
+    def metric(self, y):
+        """
+        classification error (1- accuracy)
+        """
+        return (torch.argmax(self.probs, dim=-1) != y).float()

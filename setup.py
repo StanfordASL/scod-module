@@ -14,3 +14,4 @@ setup(name="scod",
       packages=find_packages(),
       description='Equip arbitrary Pytorch models with OOD detection',
       version='0.1.0')
+
