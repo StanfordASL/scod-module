@@ -1,4 +1,4 @@
-from scod import distributions
+from typing import Union, Optional, Callable, Tuple, List
 import torch
 from torch import nn
 from copy import deepcopy
@@ -10,8 +10,18 @@ from .sketching.sketched_pca import alg_registry
 
 import numpy as np
 
+
 class Projector(nn.Module):
-    def __init__(self, N, r, device = torch.device('cpu')):
+    def __init__(self, N : int, 
+                 r : int, 
+                 device : torch.DeviceObjType = torch.device('cpu')) -> None:
+        """
+        Class which handles computations comparing a test-time jacobian to
+        the top eigenvalues and eigenvectors of the Gauss Newton matrix
+        Inputs: N, r, device
+            expects eigenvectors of dim N x r
+            eigenvalues of dim r
+        """
         super().__init__()
         self.N = N
         self.r = r
@@ -22,11 +32,13 @@ class Projector(nn.Module):
         self.basis = nn.Parameter(torch.zeros(self.N, self.r, device=self.device), requires_grad=False)
         
     @torch.no_grad()
-    def process_basis(self, eigs, basis):
+    def process_basis(self, eigs : torch.Tensor,
+                      basis : torch.Tensor) -> None:
         self.eigs.data = eigs.to(self.device)
         self.basis.data = basis.to(self.device)
 
-    def ortho_proj(self, L, n_eigs):
+    def ortho_proj(self, L : torch.Tensor, 
+                   n_eigs : torch.Tensor) -> torch.Tensor:
         """
         we have U = basis,
         computes ||(I-UU^T)L||^2_F
@@ -36,7 +48,9 @@ class Projector(nn.Module):
         proj_L = basis @ proj_L
         return torch.norm(L - proj_L) 
     
-    def posterior_pred(self, L, n_eigs, eps):
+    def posterior_pred(self, L : torch.Tensor, 
+                       n_eigs : torch.Tensor, 
+                       eps : torch.Tensor) -> torch.Tensor:
         """
         we have U = basis,
         computes ||(I-UU^T)L||^2_F
@@ -50,7 +64,10 @@ class Projector(nn.Module):
         return torch.sqrt( torch.sum(L**2) - torch.sum(proj_L**2) )
     
     @torch.no_grad()
-    def compute_distance(self, L, proj_type, n_eigs=None, eps=1.):
+    def compute_distance(self, L : torch.Tensor, 
+                         proj_type : torch.Tensor, 
+                         n_eigs : Optional[int] = None, 
+                         eps : Union[torch.Tensor , float] =1.) -> torch.Tensor:
         if n_eigs is None:
             n_eigs = self.r
             
@@ -62,7 +79,10 @@ class Projector(nn.Module):
         else:
             raise ValueError(proj_type +" is not an understood projection type.")
 
-    def compute_diag_var(self, J, P=None, n_eigs=None, eps=1):
+    def compute_diag_var(self, J : torch.Tensor, 
+                               P : Optional[torch.Tensor] = None, 
+                               n_eigs : Optional[int] = None, 
+                               eps : Union[torch.Tensor, float] = 1.) -> torch.Tensor:
         """
         given J, (d, N)
         
@@ -70,7 +90,7 @@ class Projector(nn.Module):
 
         returns diagonal variance of P J Sig J^T P^T, where
             Sig = ( 1/eps I + M U D U^T )^{-1}
-                = eps I - eps U (1/(Meps) D^{-1} + I)^{-1} U^T
+                = eps I - eps U (1/(eps) D^{-1} + I)^{-1} U^T
         """
         basis = self.basis[:,-n_eigs:]
         eigs = torch.clamp( self.eigs[-n_eigs:], min=0.)
@@ -101,11 +121,19 @@ class SCOD(nn.Module):
     """
     Wraps a trained model with functionality for adding epistemic uncertainty estimation.
     """
-    def __init__(self, model, dist_constructor, args={}, parameters=None):
+    def __init__(self, model : nn.Module, 
+                       dist_constructor : Callable[[torch.Tensor], torch.distributions.Distribution], 
+                       args : dict = {}, 
+                       parameters : Optional[nn.ParameterList] = None) -> None:
         """
         model: base DNN to equip with an uncertainty metric
-        dist_fam: distributions.DistFam object representing how to interpret output of model
+        dist_constructor: a function mapping network output to a Distribution object, defining a distribution
+            over the output space. The labels in a dataset should lie in the support of this distribution.
         args: configuration variables - defaults are in base_config
+            'num_samples': default=None, otherwise int > 0, sketch dimension T (T)
+            'num_eigs': default=10, otherwise int > 0 low rank estimate to recover (k)
+            'sketch_type': default='srft', sketch type either 'gaussian' or 'srft' for
+                linear sketching techniques, or 'ipca' for an incremental PCA approach (much slower)
         """
         super().__init__()
         
@@ -147,10 +175,13 @@ class SCOD(nn.Module):
         self.hyperparameters = [self.log_eps]
 
     @property
-    def eps(self):
+    def eps(self) -> torch.Tensor:
+        """
+        returns eps, the scale on the prior covariance
+        """
         return torch.exp(self.log_eps)
         
-    def process_dataset(self, dataset):
+    def process_dataset(self, dataset : torch.utils.data.Dataset ) -> None:
         """
         summarizes information about training data by logging gradient directions
         seen during training, and then using gram schmidt of these to form
@@ -200,9 +231,9 @@ class SCOD(nn.Module):
         self.configured.data = torch.ones(1, dtype=torch.bool)
 
     
-    def _get_weight_jacobian(self, vec):
+    def _get_weight_jacobian(self, vec : torch.Tensor) -> torch.Tensor:
         """
-        returns d x nparam matrix, with each row being d(vec[i])/d(weights)
+        returns k x nparam matrix, with each row being d(vec[i])/d(weights) for i = 1, ..., k
         """
         assert len(vec.shape) == 1
         grad_vecs = []
@@ -213,25 +244,17 @@ class SCOD(nn.Module):
             
         return torch.stack(grad_vecs)
             
-    def _get_grad_vec(self):
-        """
-        returns gradient of NN parameters flattened into a vector
-        assumes backward() has been called so each parameters grad attribute
-        has been updated
-        """
-        return torch.cat([p.grad.contiguous().view(-1) 
-                             for p in self.trainable_params]
-                        )
-    
-    def forward(self, inputs, n_eigs=None, proj_type="posterior_pred", T=None):
+    def forward(self, inputs : torch.Tensor, 
+                      n_eigs : Optional[int] = None, 
+                      proj_type : str = "posterior_pred") -> Tuple[ List[torch.distributions.Distribution], torch.Tensor ] :
         """
         assumes inputs are of shape (N, input_dims...)
         where N is the batch dimension,
               input_dims... are the dimensions of a single input
                             
         returns 
-            mu = model(inputs) -- shape (N, 1)
-            unc = hessian based uncertainty estimates shape (N)
+            mu = model(inputs) list of N distribution objects
+            unc = hessian based uncertainty estimates shape (N), torch.Tensor
         """
         if not self.configured:
             print("Must call process_dataset first before using model for predictions.")
@@ -239,12 +262,6 @@ class SCOD(nn.Module):
             
         if n_eigs is None:
             n_eigs = self.num_eigs
-
-        if T is not None and T == 0:
-            thetas = self.model(inputs)
-            dists = self.dist_constructor(thetas)
-            unc = dists.entropy()
-            return thetas, unc
             
         N = inputs.shape[0]
         
@@ -268,7 +285,7 @@ class SCOD(nn.Module):
         unc = torch.stack(unc)
         return dists, unc
 
-    def calibrate(self, val_dataset, percentile=0.99):
+    def calibrate(self, val_dataset, percentile=0.99) -> None:
         """
         evalutes the uncalibrated score on the val_dataset, 
         and then selects a
