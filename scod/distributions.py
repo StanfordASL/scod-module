@@ -68,17 +68,17 @@ class Bernoulli(distributions.Bernoulli):
             p = torch.sigmoid(kappa * self.logits)
         else:
             p = self.probs # gaussian posterior in probability space is not useful
-        return distributions.Bernoulli(probs=p)
+        return Bernoulli(probs=p)
 
     def merge_batch(self):
         p_mean = self.probs.mean(dim=0)
-        return distributions.Bernoulli(probs=p_mean)
+        return Bernoulli(probs=p_mean)
 
     def metric(self, y):
         """
         classification error (1- accuracy)
         """
-        return (torch.argmax(self.probs, dim=-1) != y).float()
+        return ((self.probs >= 0.5) != y).float()
 
 class MultivariateNormal(distributions.multivariate_normal.MultivariateNormal):
     def __init__(self, loc, covariance_matrix=None, precision_matrix=None, scale_tril=None, validate_args=None):
