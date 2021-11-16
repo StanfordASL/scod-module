@@ -7,6 +7,7 @@ from torch.cuda.amp.autocast_mode import autocast
 from tqdm import tqdm
 from torch.autograd import grad
 from .sketching.sketched_pca import alg_registry
+from .distributions import ExtendedDistribution
 
 import numpy as np
 
@@ -122,7 +123,7 @@ class SCOD(nn.Module):
     Wraps a trained model with functionality for adding epistemic uncertainty estimation.
     """
     def __init__(self, model : nn.Module, 
-                       dist_constructor : Callable[[torch.Tensor], torch.distributions.Distribution], 
+                       dist_constructor : Callable[[torch.Tensor], ExtendedDistribution], 
                        args : dict = {}, 
                        parameters : Optional[nn.ParameterList] = None) -> None:
         """

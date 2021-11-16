@@ -1,11 +1,6 @@
-from numpy.core.fromnumeric import var
 import torch
-from torch.distributions.transforms import AbsTransform
-from torch.functional import broadcast_shapes
-import torch.nn as nn
 import numpy as np
 from torch import distributions
-from torch.distributions.multivariate_normal import _batch_mahalanobis
 
 """
 this file implements different output distributional families, with their loss functions and Fisher matrices
@@ -29,7 +24,13 @@ metric(label): which returns a more human friendly measure of error between the 
 
 """
 
-class Bernoulli(distributions.Bernoulli):
+class ExtendedDistribution:
+    """
+    AbstractBaseClass
+    """
+    pass
+
+class Bernoulli(distributions.Bernoulli, ExtendedDistribution):
     def __init__(self, probs=None, logits=None, validate_args=None):
         self.use_logits = False
         if probs is None:
@@ -80,65 +81,7 @@ class Bernoulli(distributions.Bernoulli):
         """
         return ((self.probs >= 0.5) != y).float()
 
-class MultivariateNormal(distributions.multivariate_normal.MultivariateNormal):
-    def __init__(self, loc, covariance_matrix=None, precision_matrix=None, scale_tril=None, validate_args=None):
-        super().__init__(loc, covariance_matrix=covariance_matrix, precision_matrix=precision_matrix, scale_tril=scale_tril, validate_args=validate_args)
-
-    def apply_sqrt_F(self, vec):
-        """
-        if the Fisher matrix in terms of self._param is LL^T, 
-        return L^T vec, blocking gradients through L
-
-        Here, we assume only loc varies, and do not consider cov as a backpropable parameter
-        
-        F = Sigma^{-1}
-
-        Here, we use code from torch.distributions.multivariate_normal: _batched_mahalanobis()
-        but skip the square and sum operation. All this reshaping handles different batch dimensions
-        for vec and self.unbroadcasted_scale_tril, and is most likely overkill for this application
-        """
-        n = vec.size(-1)
-        batch_shape = vec.shape[:-1]
-
-        bL = self._unbroadcasted_scale_tril
-        
-        # Assume that bL.shape = (i, 1, n, n)
-        # vec.shape = (..., i, j, n)
-        # resehape vec to be (..., 1, j, i, 1, n) to apply batched tri.solve
-        bx_batch_dims = len(batch_shape)
-        bL_batch_dims = bL.dim() - 2
-        outer_batch_dims = bx_batch_dims - bL_batch_dims
-        old_batch_dims = outer_batch_dims + bL_batch_dims
-        new_batch_dims = outer_batch_dims + 2 * bL_batch_dims
-        # Reshape vec with the shape (..., 1, i, j, 1, n)
-        vec_new_shape = vec.shape[:outer_batch_dims]
-        for (sL, sx) in zip(bL.shape[:-2], vec.shape[outer_batch_dims:-1]):
-            vec_new_shape += (sx // sL, sL)
-        vec_new_shape += (n,)
-        vec = vec.reshape(vec_new_shape)
-        # Permute vec to make it have shape (..., 1, j, i, 1, n)
-        permute_dims = (list(range(outer_batch_dims)) +
-                        list(range(outer_batch_dims, new_batch_dims, 2)) +
-                        list(range(outer_batch_dims + 1, new_batch_dims, 2)) +
-                        [new_batch_dims])
-        vec = vec.permute(permute_dims)
-
-        flat_L = bL.reshape(-1, n, n)  # shape = b x n x n
-        flat_x = vec.reshape(-1, flat_L.size(0), n)  # shape = c x b x n
-        flat_x_swap = flat_x.permute(1, 2, 0)  # shape = b x n x c
-        M_swap = torch.triangular_solve(flat_x_swap, flat_L, upper=False)[0] # shape = b x n x c
-        M = M_swap.transpose(-2,-1) # (b x c x n)
-        M = M.transpose(-2,-3) # (c x b x n)
-
-        permuted_M = M.reshape(vec.shape[:-1] + (n,)) # shape = (..., 1, j, i, 1, n)
-        permute_inv_dims = list(range(outer_batch_dims))
-        for i in range(bL_batch_dims):
-            permute_inv_dims += [outer_batch_dims + i, old_batch_dims + i]
-        reshaped_M = permuted_M.permute(permute_inv_dims)  # shape = (..., 1, i, j, 1, n)
-
-        return reshaped_M.reshape(vec.shape)
-
-class Normal(distributions.normal.Normal):
+class Normal(distributions.normal.Normal, ExtendedDistribution):
     def __init__(self, loc, scale, validate_args=None):
         super().__init__(loc, scale, validate_args=validate_args)
 
@@ -173,7 +116,7 @@ class Normal(distributions.normal.Normal):
     def metric(self, y):
         return torch.mean( torch.sum( (y - self.mean)**2, dim=-1) )
 
-class Categorical(distributions.categorical.Categorical):
+class Categorical(distributions.categorical.Categorical, ExtendedDistribution):
     def __init__(self, probs=None, logits=None, validate_args=None):
         self.use_logits = False
         if probs is None:
