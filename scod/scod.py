@@ -29,14 +29,15 @@ class Projector(nn.Module):
         
         self.device = device
         
-        self.eigs = nn.Parameter(torch.zeros(self.r, device=self.device), requires_grad=False)
-        self.basis = nn.Parameter(torch.zeros(self.N, self.r, device=self.device), requires_grad=False)
+        self.eigs = nn.Parameter(1e-8*torch.ones(self.r, device=self.device), requires_grad=False)
+        self.basis = nn.Parameter(torch.randn(self.N, self.r, device=self.device), requires_grad=False)
         
     @torch.no_grad()
     def process_basis(self, eigs : torch.Tensor,
                       basis : torch.Tensor) -> None:
-        self.eigs.data = eigs.to(self.device)
-        self.basis.data = basis.to(self.device)
+        n_eigs = eigs.shape[0]
+        self.eigs.data[-n_eigs:] = eigs.to(self.device)
+        self.basis.data[:,-n_eigs:] = basis.to(self.device)
 
     def ortho_proj(self, L : torch.Tensor, 
                    n_eigs : torch.Tensor) -> torch.Tensor:

@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import numpy as np
 
 class IncrementalPCA(nn.Module):
     def __init__(self, feature_dim, n_components, center=False, device=torch.device("cpu")):
@@ -27,7 +28,7 @@ class IncrementalPCA(nn.Module):
         
         n_total = self.n_samples + n_batch
 
-        batch_mean = torch.zeros(feature_dim)
+        batch_mean = torch.zeros_like(self.running_mean)
         mean = batch_mean
         if self.center:
             batch_mean = batch_inputs.mean(dim=0)
@@ -36,7 +37,7 @@ class IncrementalPCA(nn.Module):
             mean = self.n_samples*self.running_mean + n_batch*batch_mean
             mean /= n_total
 
-        mean_correction = torch.sqrt( (self.n_samples * n_batch) * torch.ones(1) / n_total ) * (self.running_mean - batch_mean)
+        mean_correction = np.sqrt( (self.n_samples * n_batch) / n_total ) * (self.running_mean - batch_mean)
 
         X = torch.cat([
             self.singular_vals[:,None] * self.components,
@@ -56,7 +57,8 @@ class IncrementalPCA(nn.Module):
 
         # update parameters
         self.n_samples = n_total
-        self.running_mean = mean
+        if self.center:
+            self.running_mean = mean
         
         self.components = Vt[:self.n_components,:]
         self.singular_vals = S[:self.n_components]

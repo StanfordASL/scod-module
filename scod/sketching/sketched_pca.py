@@ -69,7 +69,6 @@ def fixed_rank_eig_approx(Y,W,Psi_fn,r):
     D = D[-r:]
     V = V[:,-r:] # (2k, r)
     U = U @ V # (N, r)
-    
     return U,D
 
 class SinglePassPCA():
@@ -146,10 +145,12 @@ class SRFT_SinglePassPCA(SinglePassPCA):
 
 
 class IncrementalPCA(iPCA):
-    def __init__(self, N, r, T=None, batch_size=50, device=torch.device('cpu')):
+    def __init__(self, N, r, T=None, device=torch.device('cpu')):
         super().__init__(feature_dim=N, n_components=r, device=device)
         self.counter = 0
-        self.batch_size = batch_size
+        if T is None:
+            T = 50
+        self.batch_size = T
         self.batch = []
 
     @torch.no_grad()
@@ -176,13 +177,13 @@ class IncrementalPCA(iPCA):
 
             M,d,N = batch.shape
             if d > 1:
-                U,s,Vt = torch.linalg.svd(batch, full_matrices=True)
+                U,s,Vt = torch.linalg.svd(batch, full_matrices=False)
                 batch = s[:,:,None]*Vt
 
-            self.forward(batch)
+            self.forward(batch.reshape(-1, N))
 
     def eigs(self):
-        return self.counter*self.singular_vals**2, self.components.T
+        return torch.flip(self.singular_vals**2, [0]), torch.flip(self.components, [0]).T
 
 alg_registry = {
     'gaussian': SinglePassPCA,
