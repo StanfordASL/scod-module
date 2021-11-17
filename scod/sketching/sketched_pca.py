@@ -4,6 +4,8 @@ from .ipca import IncrementalPCA as iPCA
 
 """
 Tools for extracting low-rank approximations from sketched matrices
+
+Not quite PCA because many of these algorithms don't center the data
 """
 @torch.no_grad()
 def low_rank_approx(Y,W,Psi_fn):
