@@ -158,6 +158,7 @@ class SCOD(nn.Module):
         else:
             self.trainable_params = list(parameters)
         self.n_params = int(sum(p.numel() for p in self.trainable_params))
+        print("Weight space dimension: %1.3e"%self.n_params)
                 
         self.num_samples = self.config['num_samples']
         self.num_eigs = self.config['num_eigs']
@@ -223,7 +224,7 @@ class SCOD(nn.Module):
         dataloader = torch.utils.data.DataLoader(dataset, 
                                                  batch_size=1, 
                                                  shuffle=True,
-                                                 num_workers=1,
+                                                 num_workers=4,
                                                  pin_memory=True)
         
         sketch = self.sketch_class(N=self.n_params, 
@@ -246,14 +247,15 @@ class SCOD(nn.Module):
                     # C = J_l^T J_l, where J_l = d(-log p(y | x))/dw
 
                     # ignore out-of-support labels
-                    valid_idx = dist.support.check(labels) 
-                    # raise error if there are no valid datapoints in the batch
-                    assert(torch.sum(valid_idx) > 0)
+#                     valid_idx = dist.support.check(labels) 
+#                     # raise error if there are no valid datapoints in the batch
+#                     assert(torch.sum(valid_idx) > 0)
 
-                    z_valid = z[valid_idx]
-                    labels_valid = labels[valid_idx]
-                    dist_valid = self.dist_constructor(z_valid)
-                    pre_jac_factor = -dist_valid.log_prob(labels_valid) # shape [1]
+#                     z_valid = z[valid_idx]
+#                     labels_valid = labels[valid_idx]
+#                     dist_valid = self.dist_constructor(z_valid)
+#                     pre_jac_factor = -dist_valid.log_prob(labels_valid) # shape [1]
+                    pre_jac_factor = -dist.validated_log_prob(labels)
                 else:
                     # contribution of this datapoint is
                     # C = J_f^T L L^T J
@@ -375,8 +377,8 @@ class SCOD(nn.Module):
                 pbar2.refresh()
                 pbar2.reset(total=dataset_size)
                 for inputs, labels in dataloader:                
-                    inputs = inputs.to(self.device)
-                    labels = labels.to(self.device)
+                    inputs = inputs.to(self.device, non_blocking=True)
+                    labels = labels.to(self.device, non_blocking=True)
 
                     # zero the parameter gradients
                     optimizer.zero_grad()
@@ -385,12 +387,15 @@ class SCOD(nn.Module):
                     dists, _ = self.forward(inputs)
                     loss = 0
                     for dist, label in zip(dists, labels):
-                        loss += -dist.log_prob(label)
+                        loss += -dist.validated_log_prob(label).mean()
+
+                    
+                    loss /= len(dists)
                     
                     loss.backward()
                     optimizer.step()
                     
-                    pbar2.set_postfix(batch_loss=loss.item())
+                    pbar2.set_postfix(batch_loss=loss.item(), eps=self.eps.item())
                     pbar2.update(inputs.shape[0])
             
             pbar.set_postfix(eps=self.eps.item())

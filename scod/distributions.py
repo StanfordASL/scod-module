@@ -80,6 +80,23 @@ class Bernoulli(distributions.Bernoulli, ExtendedDistribution):
         classification error (1- accuracy)
         """
         return ((self.probs >= 0.5) != y).float()
+    
+    def validated_log_prob(self, labels):
+        """
+        computes log prob, ignoring contribution from labels which are out of the support
+        """
+        valid_idx = self.support.check(labels) 
+        # raise error if there are no valid datapoints in the batch
+        assert(torch.sum(valid_idx) > 0)
+        
+        # construct dist keeping only valid slice
+        labels_valid = labels[valid_idx]
+        if self.use_logits:
+            logits_valid = self.logits[valid_idx]
+            return Bernoulli(logits = logits_valid).log_prob(labels_valid)
+        else:
+            probs_valid = self.probs[valid_idx]
+            return Bernoulli(probs = probs_valid).log_prob(labels_valid)
 
 class Normal(distributions.normal.Normal, ExtendedDistribution):
     def __init__(self, loc, scale, validate_args=None):
@@ -115,6 +132,9 @@ class Normal(distributions.normal.Normal, ExtendedDistribution):
 
     def metric(self, y):
         return torch.mean( torch.sum( (y - self.mean)**2, dim=-1) )
+    
+    def validated_log_prob(self, labels):
+        return self.log_prob(labels) # all labels are in the support of a Normal distribution
 
 class Categorical(distributions.categorical.Categorical, ExtendedDistribution):
     def __init__(self, probs=None, logits=None, validate_args=None):
@@ -166,6 +186,25 @@ class Categorical(distributions.categorical.Categorical, ExtendedDistribution):
             p = self.probs # gaussian posterior in probability space is not useful
             return Categorical(probs=p)
         return dist
+    
+    def validated_log_prob(self, labels):
+        """
+        computes log prob, ignoring contribution from labels which are out of the support
+        """
+        valid_idx = self.support.check(labels) 
+        # raise error if there are no valid datapoints in the batch
+        if torch.sum(valid_idx) == 0:
+            return torch.zeros_like(valid_idx).float()
+        
+        # construct dist keeping only valid slice
+        labels_valid = labels[valid_idx]
+        if self.use_logits:
+            logits_valid = self.logits[valid_idx,...]
+            return Categorical(logits = logits_valid).log_prob(labels_valid)
+        else:
+            probs_valid = self.probs[valid_idx,...]
+            return Categorical(probs = probs_valid).log_prob(labels_valid)
+
 
     def merge_batch(self):
         p_mean = self.probs.mean(dim=0)
