@@ -4,9 +4,10 @@ from torch import nn
 from copy import deepcopy
 from torch.cuda.amp.autocast_mode import autocast
 
-from tqdm import tqdm
+from tqdm.autonotebook import tqdm
 from torch.autograd import grad
 from .sketching.sketched_pca import alg_registry
+from .sketching.utils import random_subslice
 from .distributions import ExtendedDistribution
 
 import numpy as np
@@ -116,6 +117,9 @@ base_config = {
     'num_samples': None, # sketch size T (T)
     'num_eigs': 10, # low rank estimate to recover (k)
     'sketch_type': 'gaussian', # sketch type 
+    'offline_proj_dim': None, # whether to subsample rows during offline computation
+    'online_proj_dim': None, # whether to project output down before taking gradients at test time
+    'online_proj_type': 'gaussian' # how to do output projection
 }
 
 
@@ -162,10 +166,31 @@ class SCOD(nn.Module):
             self.num_samples = 6*self.num_eigs + 4
             
         self.configured = nn.Parameter(torch.zeros(1, dtype=torch.bool), requires_grad=False)
+
+        # --------------------------------
+        # options for offline computation
+        self.offline_projection_dim = T = self.config['offline_proj_dim']
+
+        # Empirical Fisher:
+        # Whether we should just use empirical fisher, i.e. outer products 
+        # of gradients of the negative log prob
+        self.use_empirical_fisher = (T is not None and T == 0) 
         
+        # Random proj:
+        # Rather than compute the whole Fisher, instead, randomly subsample rows of the jacobian
+        # This subsampling isn't performed if T is equal or larger than the output dimension
+        self.use_random_proj = (T is not None and T > 0)
+        
+        # Approximation alg:
+        # Determines how to aggregate per-datapoint information into final low-rank GGN approx
         self.sketch_class = alg_registry[self.config['sketch_type']] 
-        print(self.sketch_class)
         
+        # --------------------------------
+        # options for online computation
+        self.online_projection_dim = self.config['online_proj_dim']
+        self.online_projection_type = self.config['online_proj_type']
+ 
+
         self.projector = Projector(
             N=self.n_params,
             r=2*max(self.num_eigs + 2, (self.num_samples-1)//3),
@@ -198,7 +223,7 @@ class SCOD(nn.Module):
         dataloader = torch.utils.data.DataLoader(dataset, 
                                                  batch_size=1, 
                                                  shuffle=True,
-                                                 num_workers=0,
+                                                 num_workers=1,
                                                  pin_memory=True)
         
         sketch = self.sketch_class(N=self.n_params, 
@@ -213,21 +238,39 @@ class SCOD(nn.Module):
             labels = labels.to(self.device, non_blocking=True)
 
             with autocast():
-                z = self.model(inputs) # get params of output dist
-            
+                z = self.model(inputs) 
                 dist = self.dist_constructor(z)
-                Lt_z = dist.apply_sqrt_F(z).mean(dim=0) # L^\T theta
-                # flatten
-                Lt_z = Lt_z.view(-1)
 
-            
-            Lt_J = self._get_weight_jacobian(Lt_z) # L^\T J, J = dth / dw
-            sketch.low_rank_update(Lt_J.t()) # add J^T L L^T J to the sketch
+                if self.use_empirical_fisher:
+                    # contribution of this datapoint is
+                    # C = J_l^T J_l, where J_l = d(-log p(y | x))/dw
+
+                    # ignore out-of-support labels
+                    valid_idx = dist.support.check(labels) 
+                    # raise error if there are no valid datapoints in the batch
+                    assert(torch.sum(valid_idx) > 0)
+
+                    z_valid = z[valid_idx]
+                    labels_valid = labels[valid_idx]
+                    dist_valid = self.dist_constructor(z_valid)
+                    pre_jac_factor = -dist_valid.log_prob(labels_valid) # shape [1]
+                else:
+                    # contribution of this datapoint is
+                    # C = J_f^T L L^T J
+                    Lt_z = dist.apply_sqrt_F(z).mean(dim=0) # L^\T theta
+                    # flatten
+                    pre_jac_factor = Lt_z.view(-1) # shape [prod(event_shape)]
+
+                if self.use_random_proj:
+                    pre_jac_factor = random_subslice(pre_jac_factor, dim=0, k=self.offline_projection_dim, scale=True)
+
+            sqrt_C_T = self._get_weight_jacobian(pre_jac_factor) # shape ([T x N])
+
+            sketch.low_rank_update(sqrt_C_T.t()) # add C = sqrt_C sqrt_C^T to the sketch
         
-        del Lt_J
+        del sqrt_C_T # free memory @TODO: sketch could take output tensors to populate directly
         eigs, eigvs = sketch.eigs()
         del sketch
-
         self.projector.process_basis(eigs, eigvs)
             
         self.configured.data = torch.ones(1, dtype=torch.bool)
@@ -248,7 +291,7 @@ class SCOD(nn.Module):
             
     def forward(self, inputs : torch.Tensor, 
                       n_eigs : Optional[int] = None, 
-                      proj_type : str = "posterior_pred") -> Tuple[ List[torch.distributions.Distribution], torch.Tensor ] :
+                      T : Optional[int] = None) -> Tuple[ List[torch.distributions.Distribution], torch.Tensor ] :
         """
         assumes inputs are of shape (N, input_dims...)
         where N is the batch dimension,
@@ -261,31 +304,141 @@ class SCOD(nn.Module):
         if not self.configured:
             print("Must call process_dataset first before using model for predictions.")
             raise NotImplementedError
+
+        if T is None:
+            T = self.online_projection_dim
+
+        # skip computation if projection dim is 0
+        if T is not None and T == 0:
+            z = self.model(inputs)
+            dists = [self.dist_constructor(z[j,...]) for j in range(z.shape[0])]
+            unc = torch.stack([dist.entropy().sum() for dist in dists])
+            return dists, unc
             
         if n_eigs is None:
             n_eigs = self.num_eigs
             
-        N = inputs.shape[0]
+        N = inputs.shape[0] # batch size
         
-        z = self.model(inputs)        
+        z = self.model(inputs) # batch of outputs
+        flat_z = z.view(N, -1) # batch of flattened outputs
+        flat_z_shape = flat_z.shape[-1] # flattened output size
+
+        # by default there is no projection matrix and 
+        # proj_flat_z = flat_z
+        P = None # projection matrix
+        proj_flat_z = flat_z
+
+        if T is not None and T < flat_z.shape[-1]:
+            # if projection dim is provided and less than original dim
+            # @TODO: generate P through a function call depending on
+            # self.online_proj_type
+            P = torch.randn(flat_z_shape, T, device=self.device)
+            P,_ = torch.linalg.qr(P, 'reduced')
+
+            proj_flat_z = flat_z @ P
 
         unc = []
         dists = []
 
         for j in range(N):
-            J_z = self._get_weight_jacobian(z[j,...].view(-1)).detach()
+            J_proj_flat_z = self._get_weight_jacobian(proj_flat_z[j,:]).detach()
+            z_flat_var = self.projector.compute_diag_var(J_proj_flat_z, P=P, n_eigs=n_eigs, eps=self.eps)
+            z_var = z_flat_var.view(z[j,...].shape)
+
             dist = self.dist_constructor(z[j,...])
-
-            f_var = self.projector.compute_diag_var(J_z, n_eigs=n_eigs, eps=self.eps)
-            f_var = f_var.reshape(z[j,...].shape)
-
-            output_dist = dist.marginalize(f_var)
+            output_dist = dist.marginalize(z_var)
 
             dists.append( output_dist )
             unc.append( (output_dist.entropy() / self.scaling_factor ).sum())
 
         unc = torch.stack(unc)
         return dists, unc
+
+    def optimize_nll(self, 
+                     dataset : torch.utils.data.Dataset,
+                     num_epochs : int = 1,
+                     batch_size : int = 20):
+        """
+        tunes prior variance scale (eps) via SGD to minimize 
+        validation nll on a given dataset
+        """
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
+                                             shuffle=True, num_workers=4, pin_memory=True)
+        
+        dataset_size = len(dataset)
+        optimizer = torch.optim.Adam(self.hyperparameters, lr=0.1)
+
+        with tqdm(total=num_epochs, position=0) as pbar:
+            pbar2 = tqdm(total=dataset_size, position=1)
+            for epoch in range(num_epochs):
+                pbar2.refresh()
+                pbar2.reset(total=dataset_size)
+                for inputs, labels in dataloader:                
+                    inputs = inputs.to(self.device)
+                    labels = labels.to(self.device)
+
+                    # zero the parameter gradients
+                    optimizer.zero_grad()
+
+                    # forward
+                    dists, _ = self.forward(inputs)
+                    loss = 0
+                    for dist, label in zip(dists, labels):
+                        loss += -dist.log_prob(label)
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    pbar2.set_postfix(batch_loss=loss.item())
+                    pbar2.update(inputs.shape[0])
+            
+            pbar.set_postfix(eps=self.eps.item())
+            pbar.update(1)
+
+    def optimize_entropy_separation(self,
+                                    val_dataset : torch.utils.data.Dataset,
+                                    ood_dataset : torch.utils.data.Dataset,
+                                    num_epochs = 1,
+                                    batch_size = 20):
+        """
+        optimizes self.logeps via SGD, to maximize:
+            E_(x \sim ood)[unc(x)] - E_(x \sim val)[unc(x)]
+        """
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size,
+                                             shuffle=True, num_workers=2, pin_memory=True)
+        ood_dataloader = torch.utils.data.DataLoader(ood_dataset, batch_size=batch_size,
+                                        shuffle=True, num_workers=2, pin_memory=True)
+        
+        dataset_size = len(val_dataset)
+        optimizer = torch.optim.Adam(self.hyperparameters, lr=0.1)
+
+        with tqdm(total=num_epochs, position=0) as pbar:
+            pbar2 = tqdm(total=dataset_size, position=1)
+            for epoch in range(num_epochs):
+                pbar2.refresh()
+                pbar2.reset(total=dataset_size)
+                for (val_inputs, _), (ood_inputs, _) in zip(val_dataloader, ood_dataloader):                
+                    val_inputs = val_inputs.to(self.device)
+                    ood_inputs = ood_inputs.to(self.device)
+
+                    # zero the parameter gradients
+                    optimizer.zero_grad()
+
+                    # forward
+                    _, val_unc = self.forward(val_inputs)
+                    _, ood_unc = self.forward(ood_inputs)
+                    loss = val_unc.mean() - ood_unc.mean()
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    pbar2.set_postfix(batch_loss=loss.item())
+                    pbar2.update(val_inputs.shape[0])
+            
+            pbar.set_postfix(eps=self.eps.item())
+            pbar.update(1)
+
 
     def calibrate(self, val_dataset, percentile=0.99) -> None:
         """

@@ -35,3 +35,27 @@ def idct(X, norm=None):
     x[:, 1::2] += v.flip([1])[:, :N // 2]
 
     return x.view(*x_shape) 
+
+
+def random_subslice(tensor : torch.Tensor, dim : int, k : int, scale=False):
+    """
+    returns a random slice of tensor by choosing random indices in dim
+    NOTE: the subselected rows will be ordered as they originally were
+    if k >= tensor.shape[dim], we skip computation entirely
+
+    if scale is True, then we multiply by sqrt(T)/sqrt(k), such that 
+    if P is the matrix implementing this project, E[P^T P] = I
+    """
+    assert(-len(tensor.shape) < dim < len(tensor.shape))
+    if tensor.shape[dim] <= k:
+        return tensor
+    
+    indices = torch.argsort(torch.rand(tensor.shape[dim], device=tensor.device))[:k]
+    result = torch.index_select(tensor, dim, indices)
+
+    if scale:
+        factor = np.sqrt(tensor.shape[dim] / k)
+        result *= factor
+
+    return result
+    
