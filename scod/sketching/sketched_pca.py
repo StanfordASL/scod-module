@@ -182,6 +182,7 @@ class IncrementalPCA(iPCA):
                 U,s,Vt = torch.linalg.svd(batch, full_matrices=False)
                 batch = s[:,:,None]*Vt
 
+            print(batch.shape)
             self.forward(batch.reshape(-1, N))
 
     def eigs(self):

@@ -1,4 +1,5 @@
 from typing import Union, Optional, Callable, Tuple, List
+from scod.sketching.sketched_pca import SRFT_SinglePassPCA
 import torch
 from torch import nn
 from copy import deepcopy
@@ -245,17 +246,7 @@ class SCOD(nn.Module):
                 if self.use_empirical_fisher:
                     # contribution of this datapoint is
                     # C = J_l^T J_l, where J_l = d(-log p(y | x))/dw
-
-                    # ignore out-of-support labels
-#                     valid_idx = dist.support.check(labels) 
-#                     # raise error if there are no valid datapoints in the batch
-#                     assert(torch.sum(valid_idx) > 0)
-
-#                     z_valid = z[valid_idx]
-#                     labels_valid = labels[valid_idx]
-#                     dist_valid = self.dist_constructor(z_valid)
-#                     pre_jac_factor = -dist_valid.log_prob(labels_valid) # shape [1]
-                    pre_jac_factor = -dist.validated_log_prob(labels)
+                    pre_jac_factor = -dist.validated_log_prob(labels) # shape [1]
                 else:
                     # contribution of this datapoint is
                     # C = J_f^T L L^T J
@@ -277,6 +268,45 @@ class SCOD(nn.Module):
             
         self.configured.data = torch.ones(1, dtype=torch.bool)
 
+    def optimize_output_projection(self, dataset : torch.utils.data.Dataset ) -> None:
+        """
+        Loops through dataset to determine best projection matrix to use for output compression
+        """
+        dataloader = torch.utils.data.DataLoader(dataset, 
+                                                 batch_size=1, 
+                                                 shuffle=True,
+                                                 num_workers=4,
+                                                 pin_memory=True)
+        
+        sketch = None
+        
+        n_data = len(dataloader)
+        for i, (inputs,labels) in tqdm(enumerate(dataloader), total=n_data):
+            inputs = inputs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            with autocast():
+                z = self.model(inputs).view(-1) # flatten (assumes batch size = 1)
+                
+                output_shape = z.shape[0]
+                if self.use_random_proj:
+                    z, idx = random_subslice(z, dim=0, k=self.offline_projection_dim, scale=True, return_idx=True)
+
+            J = self._get_weight_jacobian(z) # shape ([T x N])
+            diag_var = (J * J).sum(-1) # shape (T)
+            if self.use_random_proj:
+                full_diag_var = torch.zeros(output_shape, device=z.device)
+                full_diag_var[idx] = diag_var
+                diag_var = full_diag_var # ( output_shape )
+            
+            if sketch is None:
+                sketch = SRFT_SinglePassPCA(N=output_shape, 
+                                        r=self.online_projection_dim,
+                                        device=self.device)
+            sketch.low_rank_update(diag_var[:,None]) # add this datapoint to the sketch
+
+        self.online_proj_basis = sketch.eigs()[1] # (output_shape x self.online_projection_dim) 
+
     
     def _get_weight_jacobian(self, vec : torch.Tensor) -> torch.Tensor:
         """
@@ -290,6 +320,18 @@ class SCOD(nn.Module):
             grad_vecs.append(g)
             
         return torch.stack(grad_vecs)
+
+    def output_projection(self, output_size, T):
+        if self.online_projection_type == 'PCA':
+            return self.online_proj_basis[:,-T:].detach()
+        elif self.online_projection_type == 'blocked':
+            P = torch.eq(torch.floor( torch.arange(output_size, device=self.device)[:,None] / (output_size // T) ), torch.arange(T, device=self.device)[None,:]).float()
+            P /= torch.norm(P, dim=0, keepdim=True)
+            return P
+        else:
+            P = torch.randn(output_size, T, device=self.device)
+            P,_ = torch.linalg.qr(P, 'reduced')
+            return P
             
     def forward(self, inputs : torch.Tensor, 
                       n_eigs : Optional[int] = None, 
@@ -335,11 +377,8 @@ class SCOD(nn.Module):
             # if projection dim is provided and less than original dim
             # @TODO: generate P through a function call depending on
             # self.online_proj_type
-            P = torch.randn(flat_z_shape, T, device=self.device)
-            P,_ = torch.linalg.qr(P, 'reduced')
-
+            P = self.output_projection(flat_z_shape, T)
             proj_flat_z = flat_z @ P
-
         unc = []
         dists = []
 
@@ -359,7 +398,7 @@ class SCOD(nn.Module):
 
     def optimize_nll(self, 
                      dataset : torch.utils.data.Dataset,
-                     num_epochs : int = 1,
+                     num_epochs : int = 2,
                      batch_size : int = 20):
         """
         tunes prior variance scale (eps) via SGD to minimize 
@@ -369,7 +408,7 @@ class SCOD(nn.Module):
                                              shuffle=True, num_workers=4, pin_memory=True)
         
         dataset_size = len(dataset)
-        optimizer = torch.optim.Adam(self.hyperparameters, lr=0.1)
+        optimizer = torch.optim.Adam(self.hyperparameters, lr=1.)
 
         with tqdm(total=num_epochs, position=0) as pbar:
             pbar2 = tqdm(total=dataset_size, position=1)
@@ -398,8 +437,8 @@ class SCOD(nn.Module):
                     pbar2.set_postfix(batch_loss=loss.item(), eps=self.eps.item())
                     pbar2.update(inputs.shape[0])
             
-            pbar.set_postfix(eps=self.eps.item())
-            pbar.update(1)
+                pbar.set_postfix(eps=self.eps.item())
+                pbar.update(1)
 
     def optimize_entropy_separation(self,
                                     val_dataset : torch.utils.data.Dataset,
@@ -468,4 +507,3 @@ class SCOD(nn.Module):
         value = torch.quantile(scores, percentile)
 
         self.scaling_factor.data *= value
-

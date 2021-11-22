@@ -37,7 +37,7 @@ def idct(X, norm=None):
     return x.view(*x_shape) 
 
 
-def random_subslice(tensor : torch.Tensor, dim : int, k : int, scale=False):
+def random_subslice(tensor : torch.Tensor, dim : int, k : int, scale=False, return_idx=False):
     """
     returns a random slice of tensor by choosing random indices in dim
     NOTE: the subselected rows will be ordered as they originally were
@@ -56,6 +56,9 @@ def random_subslice(tensor : torch.Tensor, dim : int, k : int, scale=False):
     if scale:
         factor = np.sqrt(tensor.shape[dim] / k)
         result *= factor
-
+        
+    if return_idx:
+        return result, indices
+    
     return result
     
