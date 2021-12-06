@@ -480,8 +480,8 @@ class SCOD(nn.Module):
                     pbar2.set_postfix(batch_loss=loss.item())
                     pbar2.update(val_inputs.shape[0])
             
-            pbar.set_postfix(eps=self.eps.item())
-            pbar.update(1)
+                pbar.set_postfix(eps=self.eps.item())
+                pbar.update(1)
 
 
     def calibrate(self, val_dataset, percentile=0.99) -> None:
