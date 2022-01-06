@@ -449,6 +449,7 @@ class SCOD(nn.Module):
         optimizer = torch.optim.Adam(self.hyperparameters, lr=1e-1)
 
         losses = []
+        min_eigs = []
 
         grad_counter = 0
         with tqdm(total=num_epochs, position=0) as pbar:
@@ -465,6 +466,7 @@ class SCOD(nn.Module):
                     K_gp = GP_kernel(inputs).to(self.device, non_blocking=True)
                     K_ratio = K_dnn_inv @ K_gp
 
+                    min_eig = torch.min(torch.abs(torch.linalg.eigvals(K_dnn)))
                     loss = torch.trace(K_ratio) # tr K_dnn^{-1} K_gp
                     loss -= K_dnn.shape[0] # dimension of multivariate Guassian
                     loss -= torch.slogdet(K_ratio).logabsdet # log det ( K_dnn^{-1} K_gp )
@@ -491,11 +493,12 @@ class SCOD(nn.Module):
                     pbar2.update(inputs.shape[0])
 
                     losses.append(loss.item())
+                    min_eigs.append(min_eig.item())
             
                 pbar.set_postfix(eps=self.sqrt_prior.mean().item())
                 pbar.update(1)
 
-        return losses
+        return losses, min_eigs
 
     def optimize_entropy_separation(self,
                                     val_dataset : torch.utils.data.Dataset,
