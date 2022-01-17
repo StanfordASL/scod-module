@@ -11,6 +11,8 @@ from .sketching.sketched_pca import alg_registry
 from .sketching.utils import random_subslice
 from .distributions import ExtendedDistribution
 
+from .utils import *
+
 import numpy as np
 
 
@@ -435,7 +437,8 @@ class SCOD(nn.Module):
                      GP_mu : Optional[Callable[[torch.Tensor],torch.Tensor]] = None,
                      num_epochs : int = 20,
                      batch_size : int = 5,
-                     grad_accumulation_steps : int = 5):
+                     grad_accumulation_steps : int = 5,
+                     dist_loss : str = "wass"):
         """
         tunes prior variance scale (eps) via SGD to minimize 
         difference between prior and a given GP
@@ -462,20 +465,21 @@ class SCOD(nn.Module):
                     labels = labels.to(self.device, non_blocking=True)
 
                     K_dnn = self.kernel_matrix(inputs, prior_only=True)
-                    K_dnn_inv = torch.linalg.inv(K_dnn + 1e-5*torch.eye(K_dnn.shape[0]))
-                    K_gp = GP_kernel(inputs).to(self.device, non_blocking=True)
-                    K_ratio = K_dnn_inv @ K_gp
-
                     min_eig = torch.min(torch.abs(torch.linalg.eigvals(K_dnn)))
-                    loss = torch.trace(K_ratio) # tr K_dnn^{-1} K_gp
-                    loss -= K_dnn.shape[0] # dimension of multivariate Guassian
-                    loss -= torch.slogdet(K_ratio).logabsdet # log det ( K_dnn^{-1} K_gp )
+
+                    K_gp = GP_kernel(inputs).to(self.device, non_blocking=True)
+                    err = None
                     if GP_mu is not None:
                         mu_dnn = self.model(inputs)
                         mu_gp = GP_mu(inputs)
                         err = (mu_dnn - mu_gp).view(-1)
-                        loss += torch.dot(err, K_dnn_inv @ err) # (mu_dnn - mu_gp)^T K_dnn^{-1} (mu_dnn - mu_gp)
 
+                    if dist_loss == "fwd_kl":
+                        loss = gaussianKLDiv(K_gp, K_dnn, err)
+                    elif dist_loss == "rev_kl":
+                        loss = gaussianKLDiv(K_dnn, K_gp, err)
+                    else:
+                        loss = gaussianWassersteinDist(K_gp, K_dnn, err)
 
                     loss = loss / grad_accumulation_steps
                     
@@ -484,6 +488,8 @@ class SCOD(nn.Module):
                     grad_counter += 1
 
                     if grad_counter % grad_accumulation_steps == 0:
+                        # clip gradients
+                        nn.utils.clip_grad_norm_(self.hyperparameters, 5.)
                         # after grad_accumulation steps have passed, then take the gradient step
                         optimizer.step()
                         # zero the parameter gradients
