@@ -279,8 +279,8 @@ class SCOD(nn.Module):
         del sqrt_C_T # free memory @TODO: sketch could take output tensors to populate directly
         eigs, eigvs = sketch.eigs()
         del sketch
-        self.GGN_eigs.data = eigs
-        self.GGN_basis.data = eigvs
+        self.GGN_eigs.data = eigs.to(self.device)
+        self.GGN_basis.data = eigvs.to(self.device)
         self.GGN_sqrt_prior.data = copy(self.sqrt_prior)
         self.GGN_is_aligned = True
             
