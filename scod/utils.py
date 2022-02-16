@@ -1,7 +1,6 @@
 import torch
-import numpy as np
 
-def gaussianKLDiv(Sig1, Sig2, err=None):
+def gaussian_kl_div(Sig1, Sig2, err=None):
     """
     computes D_KL( N(mu1, Sig1) || N(mu2, Sig2) ) where err = mu1 - mu2 (or mu2 - mu1)
     """
@@ -17,7 +16,7 @@ def gaussianKLDiv(Sig1, Sig2, err=None):
 
     return loss
 
-def gaussianWassersteinDist(Sig1, Sig2, err=None):
+def gaussian_wasserstein_dist(Sig1, Sig2, err=None):
     """
     Computes W_2( N(mu1, Sig1),  N(mu2, Sig2) ) where err = mu1 - mu2
     """
@@ -32,3 +31,4 @@ def gaussianWassersteinDist(Sig1, Sig2, err=None):
         loss += (err**2).sum()
 
     return loss
+    
