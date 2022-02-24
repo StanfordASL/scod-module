@@ -11,7 +11,7 @@ from torch.cuda.amp.autocast_mode import autocast
 
 from tqdm.autonotebook import tqdm
 
-from .sketching.sketched_pca import alg_registry, SRFT_SinglePassPCA
+from .sketching.sketched_pca import alg_registry
 from .sketching.utils import random_subslice
 from .distributions import ExtendedDistribution
 from .utils import gaussian_kl_div, gaussian_wasserstein_dist
@@ -285,7 +285,11 @@ class SCOD(nn.Module):
 
         return JJT - neg_term
 
-    def process_dataset(self, dataset: torch.utils.data.Dataset) -> None:
+    def process_dataset(
+        self,
+        dataset: torch.utils.data.Dataset,
+        dataloader_kwargs: Optional[dict] = None,
+    ) -> None:
         """
         summarizes information about training data by logging gradient directions
         seen during training, and then using gram schmidt of these to form
@@ -296,10 +300,15 @@ class SCOD(nn.Module):
         """
         # loop through data, one sample at a time
         print("computing basis")
+        if dataloader_kwargs is None:
+            dataloader_kwargs = {
+                "num_workers": 4,
+            }
+            if self.device.type != "cpu":
+                dataloader_kwargs["pin_memory"] = True
+        dataloader_kwargs.update({"batch_size": 1})
 
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True
-        )
+        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
         sketch = self.sketch_class(
             N=self.n_weights, r=self.num_eigs, T=self.num_samples, device=self.device
@@ -459,17 +468,24 @@ class SCOD(nn.Module):
     def optimize_prior_scale_by_nll(
         self,
         dataset: torch.utils.data.Dataset,
+        dataloader_kwargs: Optional[dict] = None,
         num_epochs: int = 2,
-        batch_size: int = 20,
     ):
         """
         tunes prior variance scale (eps) via SGD to minimize
         validation nll on a given dataset
         """
         self.GGN_is_aligned = False
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
-        )
+        if dataloader_kwargs is None:
+            dataloader_kwargs = {
+                "num_workers": 4,
+                "batch_size": 20,
+                "shuffle": True,
+            }
+            if self.device.type != "cpu":
+                dataloader_kwargs["pin_memory"] = True
+
+        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
         dataset_size = len(dataset)
         optimizer = torch.optim.Adam(self.hyperparameters, lr=1e-1)
@@ -518,8 +534,8 @@ class SCOD(nn.Module):
         dataset: torch.utils.data.Dataset,
         GP_kernel: Callable[[torch.Tensor], torch.Tensor],
         GP_mu: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        dataloader_kwargs: Optional[dict] = None,
         num_epochs: int = 20,
-        batch_size: int = 5,
         grad_accumulation_steps: int = 5,
         dist_loss: str = "wass",
     ):
@@ -529,9 +545,16 @@ class SCOD(nn.Module):
         GP_kernel should take in a batch of data and produce a gram matrix
         """
         self.GGN_is_aligned = False
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
-        )
+        if dataloader_kwargs is None:
+            dataloader_kwargs = {
+                "num_workers": 4,
+                "batch_size": 20,
+                "shuffle": True,
+            }
+            if self.device.type != "cpu":
+                dataloader_kwargs["pin_memory"] = True
+
+        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
         dataset_size = len(dataset)
         optimizer = torch.optim.Adam(self.hyperparameters, lr=1e-1)
@@ -592,110 +615,3 @@ class SCOD(nn.Module):
                 pbar.update(1)
 
         return losses, min_eigs
-
-    def optimize_entropy_separation(
-        self,
-        val_dataset: torch.utils.data.Dataset,
-        ood_dataset: torch.utils.data.Dataset,
-        num_epochs=1,
-        batch_size=20,
-    ):
-        r"""
-        optimizes self.logeps via SGD, to maximize:
-            E_(x \sim ood)[unc(x)] - E_(x \sim val)[unc(x)]
-        """
-        self.GGN_is_aligned = False
-
-        val_dataloader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-        )
-        ood_dataloader = torch.utils.data.DataLoader(
-            ood_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-        )
-
-        dataset_size = len(val_dataset)
-        optimizer = torch.optim.Adam(self.hyperparameters, lr=0.1)
-
-        with tqdm(total=num_epochs, position=0) as pbar:
-            pbar2 = tqdm(total=dataset_size, position=1)
-            for epoch in range(num_epochs):
-                pbar2.refresh()
-                pbar2.reset(total=dataset_size)
-                for (val_inputs, _), (ood_inputs, _) in zip(
-                    val_dataloader, ood_dataloader
-                ):
-                    val_inputs = val_inputs.to(self.device)
-                    ood_inputs = ood_inputs.to(self.device)
-
-                    # zero the parameter gradients
-                    optimizer.zero_grad()
-
-                    # forward
-                    _, val_unc = self.forward(val_inputs)
-                    _, ood_unc = self.forward(ood_inputs)
-                    loss = val_unc.mean() - ood_unc.mean()
-
-                    loss.backward()
-                    optimizer.step()
-
-                    pbar2.set_postfix(batch_loss=loss.item())
-                    pbar2.update(val_inputs.shape[0])
-
-                pbar.set_postfix(eps=self.sqrt_prior.mean().item())
-                pbar.update(1)
-
-    def optimize_output_projection(self, dataset: torch.utils.data.Dataset) -> None:
-        """
-        Loops through dataset to determine best projection matrix to use for output compression
-        @TODO: this doesn't work, debug...
-        """
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True
-        )
-
-        sketch = None
-
-        n_data = len(dataloader)
-        for i, (inputs, labels) in tqdm(enumerate(dataloader), total=n_data):
-            inputs = inputs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-
-            with autocast():
-                z = self.model(inputs).view(-1)  # flatten (assumes batch size = 1)
-
-                output_shape = z.shape[0]
-                if self.use_random_proj:
-                    z, idx = random_subslice(
-                        z,
-                        dim=0,
-                        k=self.offline_projection_dim,
-                        scale=True,
-                        return_idx=True,
-                    )
-
-            J = self._get_weight_jacobian(z)  # shape ([T x N])
-            diag_var = (J * J).sum(-1)  # shape (T)
-            if self.use_random_proj:
-                full_diag_var = torch.zeros(output_shape, device=z.device)
-                full_diag_var[idx] = diag_var
-                diag_var = full_diag_var  # ( output_shape )
-
-            if sketch is None:
-                sketch = SRFT_SinglePassPCA(
-                    N=output_shape, r=self.online_projection_dim, device=self.device
-                )
-            sketch.low_rank_update(
-                diag_var[:, None]
-            )  # add this datapoint to the sketch
-
-        self.online_proj_basis = sketch.eigs()[
-            1
-        ]  # (output_shape x self.online_projection_dim)
