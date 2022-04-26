@@ -3,6 +3,7 @@ SCOD: Sketching Curvature for OOD Detection
 """
 from typing import Optional, Callable, Tuple, List
 from copy import deepcopy, copy
+import math
 
 import torch
 from torch import nn
@@ -21,10 +22,12 @@ base_config = {
     "num_samples": None,  # sketch size T (T)
     "num_eigs": 10,  # low rank estimate to recover (k)
     "prior_type": "scalar",  # options are 'scalar' (isotropic prior), 'per_parameter', 'per_weight'
+    "prior_scale": 1., # initial prior scale
     "sketch_type": "gaussian",  # sketch type
     "offline_proj_dim": None,  # whether to subsample rows during offline computation
     "online_proj_dim": None,  # whether to project output down before taking gradients at test time
     "online_proj_type": "gaussian",  # how to do output projection
+    "metric_threshold": None, # if not None, expects a float indicating whether to ignore a training point
 }
 
 
@@ -88,6 +91,7 @@ class SCOD(nn.Module):
         # ---------------------------
         # options for prior representation and computation
         self.prior_type = self.config["prior_type"]
+        self.init_log_prior_scale = math.log(self.config['prior_scale'])
         self.log_prior_scale = nn.Parameter(self._init_log_prior(), requires_grad=True)
 
         # --------------------------------
@@ -107,6 +111,10 @@ class SCOD(nn.Module):
         # Approximation alg:
         # Determines how to aggregate per-datapoint information into final low-rank GGN approx
         self.sketch_class = alg_registry[self.config["sketch_type"]]
+
+        # Points to consider:
+        # If not None, then SCOD ignores points where metric > threshold
+        self.metric_threshold = self.config["metric_threshold"]
 
         # --------------------------------
         # options for online computation
@@ -150,7 +158,7 @@ class SCOD(nn.Module):
             raise ValueError(
                 "prior_type must be one of (scalar, per_parameter, per_weight)"
             )
-        return torch.zeros(n_prior_params, device=self.device)
+        return self.init_log_prior_scale * torch.ones(n_prior_params, device=self.device)
 
     def _broadcast_to_n_weights(self, v: torch.Tensor) -> torch.Tensor:
         """Broadcasts a vector to be the length of self.n_weights
@@ -322,6 +330,10 @@ class SCOD(nn.Module):
             with autocast():
                 z = self.model(inputs)
                 dist = self.dist_constructor(z)
+                if self.metric_threshold is not None:
+                    metric = dist.metric(labels).mean()
+                    if metric > self.metric_threshold:
+                        continue
 
                 if self.use_empirical_fisher:
                     # contribution of this datapoint is
@@ -350,8 +362,8 @@ class SCOD(nn.Module):
         del sqrt_C_T  # free memory @TODO: sketch could take output tensors to populate directly
         eigs, eigvs = sketch.eigs()
         del sketch
-        self.GGN_eigs.data = eigs.to(self.device)
-        self.GGN_basis.data = eigvs.to(self.device)
+        self.GGN_eigs.data = eigs[-self.num_eigs:].to(self.device)
+        self.GGN_basis.data = eigvs[:,-self.num_eigs:].to(self.device)
         self.GGN_sqrt_prior.data = copy(self.sqrt_prior)
         self.GGN_is_aligned = True
 
@@ -400,6 +412,7 @@ class SCOD(nn.Module):
         inputs: torch.Tensor,
         use_prior: bool = False,
         n_eigs: Optional[int] = None,
+        prior_multiplier: float = 1.,
         T: Optional[int] = None,
     ) -> Tuple[List[torch.distributions.Distribution], torch.Tensor]:
         """
@@ -411,6 +424,7 @@ class SCOD(nn.Module):
             mu = model(inputs) list of N distribution objects
             unc = hessian based uncertainty estimates shape (N), torch.Tensor
         """
+        self.log_prior_scale.data += math.log(prior_multiplier)
         if T is None:
             T = self.online_projection_dim
 
@@ -463,6 +477,10 @@ class SCOD(nn.Module):
             unc.append((output_dist.entropy()).sum())
 
         unc = torch.stack(unc)
+
+        self.log_prior_scale.data -= math.log(prior_multiplier)
+
+
         return dists, unc
 
     def optimize_prior_scale_by_nll(
