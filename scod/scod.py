@@ -131,9 +131,6 @@ class SCOD(nn.Module):
             requires_grad=False,
         )
 
-        # rescaling factor
-        self.alpha = nn.Parameter( torch.zeros(1, device=self.device), requires_grad=False)
-
         # stores what prior scales were used in GGN computation
         self.GGN_sqrt_prior = nn.Parameter(copy(self.sqrt_prior), requires_grad=False)
         self.GGN_is_aligned = True
@@ -257,8 +254,8 @@ class SCOD(nn.Module):
 
         Assumes J is the jacobian already scaled by the sqrt prior covariance.
 
-        Returns diag( J ( (1-alpha) I - U D U^T ) J^T )
-        where D = diag( eigs / (eigs + 1) - alpha)
+        Returns diag( J ( I - U D U^T ) J^T )
+        where D = diag( eigs / (eigs + 1))
 
         and U diag(eigs) U^T ~= G, the Gauss Newton matrix computed using gradients
         already scaled by the sqrt prior covariance
@@ -278,7 +275,7 @@ class SCOD(nn.Module):
         eigs = torch.clamp(self.GGN_eigs[-n_eigs:], min=0.0)
 
         if self.GGN_is_aligned:
-            scaling = eigs / (eigs + 1.0) - self.alpha
+            scaling = eigs / (eigs + 1.0)
             neg_term = J @ basis
             neg_term = neg_term @ (scaling[:, None] * neg_term.T)
         else:
@@ -288,11 +285,11 @@ class SCOD(nn.Module):
                 self.sqrt_prior / self.GGN_sqrt_prior
             )
             basis = rescaling[:, None] * basis
-            inv_term = torch.linalg.inv(torch.diag_embed(1.0 / eigs - self.alpha) + basis.T @ basis)
+            inv_term = torch.linalg.inv(torch.diag_embed(1.0 / eigs) + basis.T @ basis)
             scaled_jac = J @ basis
             neg_term = scaled_jac @ inv_term @ scaled_jac.T
 
-        return (1-self.alpha)*JJT - neg_term
+        return JJT - neg_term
 
     def process_dataset(
         self,
@@ -367,49 +364,6 @@ class SCOD(nn.Module):
         self.GGN_basis.data = eigvs[:,-self.num_eigs:].to(self.device)
         self.GGN_sqrt_prior.data = copy(self.sqrt_prior)
         self.GGN_is_aligned = True
-
-        # now loop over again to estimate alpha
-        print("Estimating alpha")
-        total_unmodeled_energy = 0.
-
-        for i, (inputs, labels) in tqdm(enumerate(dataloader), total=n_data):
-            inputs = inputs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-
-            with autocast():
-                z = self.model(inputs)
-                dist = self.dist_constructor(z)
-                if self.metric_threshold is not None:
-                    metric = dist.metric(labels).mean()
-                    if metric > self.metric_threshold:
-                        continue
-
-                if self.use_empirical_fisher:
-                    # contribution of this datapoint is
-                    # C = J_l^T J_l, where J_l = d(-log p(y | x))/dw
-                    pre_jac_factor = -dist.validated_log_prob(labels)  # shape [1]
-                else:
-                    # contribution of this datapoint is
-                    # C = J_f^T L L^T J
-                    Lt_z = dist.apply_sqrt_F(z).mean(dim=0)  # L^\T theta
-                    # flatten
-                    pre_jac_factor = Lt_z.view(-1)  # shape [prod(event_shape)]
-
-                if self.use_random_proj:
-                    pre_jac_factor = random_subslice(
-                        pre_jac_factor, dim=0, k=self.offline_projection_dim, scale=True
-                    )
-
-            sqrt_C_T = self._get_weight_jacobian(
-                pre_jac_factor, scaled_by_prior=True
-            )  # shape ([T x N])
-
-            proj_sqrt_C_T = sqrt_C_T @ self.GGN_basis
-
-            total_unmodeled_energy += ( sqrt_C_T.sum()**2 - proj_sqrt_C_T.sum()**2 ).detach()
-        
-        print(total_unmodeled_energy.item())
-        self.alpha.data = total_unmodeled_energy / (self.n_weights - self.num_eigs + total_unmodeled_energy)
 
         self.configured.data = torch.ones(1, dtype=torch.bool)
 
