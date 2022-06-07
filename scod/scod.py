@@ -1,7 +1,7 @@
 """
 SCOD: Sketching Curvature for OOD Detection
 """
-from typing import Optional, Callable, Tuple, List
+from typing import Optional, Tuple, List
 from copy import deepcopy, copy
 import math
 
@@ -14,8 +14,7 @@ from tqdm.autonotebook import tqdm
 
 from .sketching.sketched_pca import alg_registry
 from .sketching.utils import random_subslice
-from .distributions import ExtendedDistribution
-from .utils import gaussian_kl_div, gaussian_wasserstein_dist
+from .distributions import DistributionLayer
 
 
 base_config = {
@@ -38,7 +37,6 @@ class SCOD(nn.Module):
     def __init__(
         self,
         model: nn.Module,
-        dist_constructor: Callable[[torch.Tensor], ExtendedDistribution],
         args: Optional[dict] = None,
         parameters: Optional[nn.ParameterList] = None,
     ) -> None:
@@ -46,8 +44,6 @@ class SCOD(nn.Module):
 
         Args:
             model (nn.Module): Pre-trained DNN
-            dist_constructor (Callable[[torch.Tensor], ExtendedDistribution]):
-                Function mapping DNN output to a ExtendedDistribution object.
             args (dict, optional):
                 Configuration parameters for SCOD. If None, uses default settings. Defaults to None.
             parameters (nn.ParameterList, optional):
@@ -61,7 +57,6 @@ class SCOD(nn.Module):
             self.config.update(args)
 
         self.model = model
-        self.dist_constructor = dist_constructor
 
         # extract device from model
         device = next(model.parameters()).device
@@ -294,6 +289,7 @@ class SCOD(nn.Module):
     def process_dataset(
         self,
         dataset: torch.utils.data.Dataset,
+        dist_layer: DistributionLayer,
         dataloader_kwargs: Optional[dict] = None,
     ) -> None:
         """
@@ -303,6 +299,7 @@ class SCOD(nn.Module):
         taken to be irrelevant to data, and used for detecting generalization
 
         dataset - torch dataset of (input, target) pairs
+        dist_layer: DistributionLayer mapping output of model to a distribution on y
         """
         # infer device from model:
         device = next(self.model.parameters()).device
@@ -330,20 +327,19 @@ class SCOD(nn.Module):
 
             with autocast():
                 z = self.model(inputs)
-                dist = self.dist_constructor(z)
                 if self.metric_threshold is not None:
-                    metric = dist.metric(labels).mean()
+                    metric = dist_layer.metric(z, labels).mean()
                     if metric > self.metric_threshold:
                         continue
 
                 if self.use_empirical_fisher:
                     # contribution of this datapoint is
                     # C = J_l^T J_l, where J_l = d(-log p(y | x))/dw
-                    pre_jac_factor = -dist.validated_log_prob(labels)  # shape [1]
+                    pre_jac_factor = -dist_layer.validated_log_prob(z, labels)  # shape [1]
                 else:
                     # contribution of this datapoint is
                     # C = J_f^T L L^T J
-                    Lt_z = dist.apply_sqrt_F(z).mean(dim=0)  # L^\T theta
+                    Lt_z = dist_layer.apply_sqrt_F(z).mean(dim=0)  # L^\T theta
                     # flatten
                     pre_jac_factor = Lt_z.view(-1)  # shape [prod(event_shape)]
 
@@ -422,8 +418,8 @@ class SCOD(nn.Module):
               input_dims... are the dimensions of a single input
 
         Returns
-            dists (list): list of N distribution objects, output of model.tensor
-            unc (torch.Tensor):  SCOD uncertainty estimates, shape (N)
+            z_mean : model(inputs)
+            z_var : diagonal scod predictive variance for inputs
         """
         self.log_prior_scale.data += math.log(prior_multiplier)
         if T is None:
@@ -431,10 +427,9 @@ class SCOD(nn.Module):
 
         # skip computation if projection dim is 0
         if T is not None and T == 0:
-            z = self.model(inputs)
-            dists = [self.dist_constructor(z[j, ...]) for j in range(z.shape[0])]
-            unc = torch.stack([dist.entropy().sum() for dist in dists])
-            return dists, unc
+            z_mean = self.model(inputs)
+            z_var = torch.zeros_like(z_mean)
+            return z_mean, z_var
 
         if n_eigs is None:
             n_eigs = self.num_eigs
@@ -442,8 +437,8 @@ class SCOD(nn.Module):
         N = inputs.shape[0]  # batch size
         device = inputs.device # used to ensure compatibility of constructed tensors
 
-        z = self.model(inputs)  # batch of outputs
-        flat_z = z.view(N, -1)  # batch of flattened outputs
+        z_mean = self.model(inputs)  # batch of outputs
+        flat_z = z_mean.view(N, -1)  # batch of flattened outputs
         flat_z_shape = flat_z.shape[-1]  # flattened output size
 
         # by default there is no projection matrix and proj_flat_z = flat_z
@@ -454,187 +449,26 @@ class SCOD(nn.Module):
             P = self._output_projection(flat_z_shape, T, device)
             proj_flat_z = flat_z @ P
 
-        unc = []
-        dists = []
+        z_vars = []
         for j in range(N):
-            J_proj_flat_z = self._get_weight_jacobian(
+            J_proj_flat_zj = self._get_weight_jacobian(
                 proj_flat_z[j, :], scaled_by_prior=True
             )
-            proj_flat_z_var = self._predictive_var(
-                J_proj_flat_z, n_eigs=n_eigs, prior_only=use_prior
+            proj_flat_zj_var = self._predictive_var(
+                J_proj_flat_zj, n_eigs=n_eigs, prior_only=use_prior
             )
             if P is not None:
-                chol_sig = torch.linalg.cholesky(proj_flat_z_var)
-                flat_z_diag_var = torch.sum(
+                chol_sig = torch.linalg.cholesky(proj_flat_zj_var)
+                flat_zj_diag_var = torch.sum(
                     (P @ chol_sig) ** 2, dim=-1
                 )  # ( P[:,None,:] @ ( (JJT - neg_term) @ P.T) )[:,0]
             else:
-                flat_z_diag_var = torch.diagonal(proj_flat_z_var)
+                flat_zj_diag_var = torch.diagonal(proj_flat_zj_var)
 
-            z_var = flat_z_diag_var.view(z[j, ...].shape)
-            dist = self.dist_constructor(z[j, ...])
-            output_dist = dist.marginalize(z_var)
+            zj_var = flat_zj_diag_var.view(z_mean[j, ...].shape)
+            z_vars.append(zj_var)
 
-            dists.append(output_dist)
-            unc.append((output_dist.entropy()).sum())
-
-        unc = torch.stack(unc)
+        z_var = torch.stack(z_vars)
 
         self.log_prior_scale.data -= math.log(prior_multiplier)
-
-
-        return dists, unc
-
-    def optimize_prior_scale_by_nll(
-        self,
-        dataset: torch.utils.data.Dataset,
-        dataloader_kwargs: Optional[dict] = None,
-        num_epochs: int = 2,
-    ):
-        """
-        tunes prior variance scale (eps) via SGD to minimize
-        validation nll on a given dataset
-        """
-        device = next(self.model.parameters()).device
-
-        self.GGN_is_aligned = False
-        if dataloader_kwargs is None:
-            dataloader_kwargs = {
-                "num_workers": 4,
-                "batch_size": 20,
-                "shuffle": True,
-            }
-            if device.type != "cpu":
-                dataloader_kwargs["pin_memory"] = True
-
-        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-
-        dataset_size = len(dataset)
-        optimizer = torch.optim.Adam(self.hyperparameters, lr=1e-1)
-
-        losses = []
-
-        with tqdm(total=num_epochs, position=0) as pbar:
-            pbar2 = tqdm(total=dataset_size, position=1)
-            for epoch in range(num_epochs):
-                pbar2.refresh()
-                pbar2.reset(total=dataset_size)
-                for inputs, labels in dataloader:
-                    inputs = inputs.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
-
-                    # zero the parameter gradients
-                    optimizer.zero_grad()
-
-                    # forward
-                    dists, _ = self.forward(inputs)
-                    loss = 0
-                    for dist, label in zip(dists, labels):
-                        loss += -dist.log_prob(
-                            label
-                        ).mean()
-
-                    loss /= len(dists)
-
-                    loss.backward()
-                    optimizer.step()
-
-                    pbar2.set_postfix(
-                        batch_loss=loss.item(), eps=self.sqrt_prior.mean().item()
-                    )
-                    pbar2.update(inputs.shape[0])
-
-                    losses.append(loss.item())
-
-                pbar.set_postfix(eps=self.sqrt_prior.mean().item())
-                pbar.update(1)
-
-        return losses
-
-    def optimize_prior_scale_by_GP_kernel(
-        self,
-        dataset: torch.utils.data.Dataset,
-        GP_kernel: Callable[[torch.Tensor], torch.Tensor],
-        GP_mu: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        dataloader_kwargs: Optional[dict] = None,
-        num_epochs: int = 20,
-        grad_accumulation_steps: int = 5,
-        dist_loss: str = "wass",
-    ):
-        """
-        tunes prior variance scale (eps) via SGD to minimize
-        difference between prior and a given GP
-        GP_kernel should take in a batch of data and produce a gram matrix
-        """
-        device = next(self.model.parameters()).device
-        self.GGN_is_aligned = False
-        if dataloader_kwargs is None:
-            dataloader_kwargs = {
-                "num_workers": 4,
-                "batch_size": 20,
-                "shuffle": True,
-            }
-            if device.type != "cpu":
-                dataloader_kwargs["pin_memory"] = True
-
-        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-
-        dataset_size = len(dataset)
-        optimizer = torch.optim.Adam(self.hyperparameters, lr=1e-1)
-
-        losses = []
-        min_eigs = []
-
-        grad_counter = 0
-        with tqdm(total=num_epochs, position=0) as pbar:
-            pbar2 = tqdm(total=dataset_size, position=1)
-            for epoch in range(num_epochs):
-                pbar2.refresh()
-                pbar2.reset(total=dataset_size)
-                for inputs, labels in dataloader:
-                    inputs = inputs.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
-
-                    K_dnn = self._kernel_matrix(inputs, prior_only=True)
-                    min_eig = torch.min(torch.abs(torch.linalg.eigvals(K_dnn)))
-
-                    K_gp = GP_kernel(inputs).to(device, non_blocking=True)
-                    err = None
-                    if GP_mu is not None:
-                        mu_dnn = self.model(inputs)
-                        mu_gp = GP_mu(inputs)
-                        err = (mu_dnn - mu_gp).view(-1)
-
-                    if dist_loss == "fwd_kl":
-                        loss = gaussian_kl_div(K_gp, K_dnn, err)
-                    elif dist_loss == "rev_kl":
-                        loss = gaussian_kl_div(K_dnn, K_gp, err)
-                    else:
-                        loss = gaussian_wasserstein_dist(K_gp, K_dnn, err)
-
-                    loss = loss / grad_accumulation_steps
-
-                    loss.backward()
-
-                    grad_counter += 1
-
-                    if grad_counter % grad_accumulation_steps == 0:
-                        # clip gradients
-                        nn.utils.clip_grad_norm_(self.hyperparameters, 5.0)
-                        # after grad_accumulation steps have passed, then take the gradient step
-                        optimizer.step()
-                        # zero the parameter gradients
-                        optimizer.zero_grad()
-
-                    pbar2.set_postfix(
-                        batch_loss=loss.item(), eps=self.sqrt_prior.mean().item()
-                    )
-                    pbar2.update(inputs.shape[0])
-
-                    losses.append(loss.item())
-                    min_eigs.append(min_eig.item())
-
-                pbar.set_postfix(eps=self.sqrt_prior.mean().item())
-                pbar.update(1)
-
-        return losses, min_eigs
+        return z_mean, z_var

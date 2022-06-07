@@ -20,10 +20,275 @@ metric(label): which returns a more human friendly measure of error between the 
 
 """
 from abc import abstractmethod
+from typing import Tuple
 import torch
 import numpy as np
 from torch import distributions
+from torch import nn
 
+class DistributionLayer(nn.Module):
+    """
+    A layer mapping network output to a distribution object    
+    """
+    @abstractmethod
+    def forward(self, z : torch.Tensor) -> distributions.Distribution:
+        """
+        Returns torch.Distribution object specified by z
+
+        Args:
+            z (torch.Tensor): parameter of output distribution
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def marginalize_gaussian(self, z_mean : torch.Tensor, z_var : torch.Tensor) -> distributions.Distribution:
+        """
+        If z \sim N(z_mean, z_var), estimates p(y) = E_z [ p(y \mid z) ]
+
+        Args:
+            z_mean (torch.Tensor): mean of z
+            z_var (torch.Tensor): diagonal variance of z (same size as z_mean)
+
+        Returns:
+            distributions.Distribution: p(y)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def marginalize_samples(self, z_samples : torch.Tensor, batch_idx : int = 0) -> distributions.Distribution:
+        """
+        Given samples of z, estimates p(y) = E_z [ p(y \mid z) ] over empirical distribution
+
+        Args:
+            z_samples (torch.Tensor): [..., M, ..., z_dim]
+            batch_idx (int): index over which to marginalize, assumed to be 0
+
+        Returns:
+            distributions.Distribution: p(y)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_sqrt_F(self, z : torch.Tensor) -> torch.Tensor:
+        """
+        The Fisher Information Matrix of the output distribution is given by
+            $$ F = E_{y \sim p(y | z)}[ d^2/dz^2 \log p (y \mid z)] $$
+        If we factor F(z) = L(z) L(z)^T
+        This function returns [ L(z)^T ].detach() @ z 
+
+        Args:
+            z (torch.Tensor): parameter of p(y | z)
+
+        Returns:
+            torch.Tensor: parameter scaled by the square root of the fisher matrix, [ L(z)^T ].detach() z 
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def metric(self, z : torch.Tensor, y : torch.Tensor) -> torch.Tensor:
+        """
+        Returns a metric of Error(y,z), e.g. MSE for regression, 0-1 error for classification
+
+        Args:
+            z (torch.Tensor): parameter of distribution
+            y (torch.Tensor): target
+
+        Returns:
+            torch.Tensor: Error(y, z)
+        """
+        raise NotImplementedError
+
+    def log_prob(self, z : torch.Tensor, y : torch.Tensor) -> torch.Tensor:
+        """
+        Returns log p( y | z)
+
+        Args:
+            z (torch.Tensor): parameter of distribution
+            y (torch.Tensor): target
+
+        Returns:
+            torch.Tensor: log p ( labels | dist )
+        """
+        return self.forward(z).log_prob(y)
+
+    def validated_log_prob(self, z : torch.Tensor, y : torch.Tensor) -> torch.Tensor:
+        """
+        Checks if each element of y is in the support of the distribution specified by z
+        Computes mean log_prob only on the elements 
+
+        Args:
+            z (torch.Tensor): parameter of distribution
+            y (torch.Tensor): target
+
+        Returns:
+            torch.Tensor: log p ( valid_y | corresponding_z )
+        """
+        dist = self.forward(z)
+        valid_idx = dist.support.check(y)
+        # raise error if there are no valid datapoints in the batch
+        assert torch.sum(valid_idx) > 0
+
+        # construct dist keeping only valid slice
+        valid_y = y[valid_idx]
+        valid_z = z[valid_idx]
+        return self.forward(valid_z).log_prob(valid_y)
+
+class BernoulliLogitsLayer(DistributionLayer):
+    """
+    Implements Bernoulli RV parameterized by logits.
+    """
+    def forward(self, z: torch.Tensor) -> distributions.Distribution:
+        return distributions.Bernoulli(logits = z)
+    
+    def marginalize_gaussian(self, z_mean: torch.Tensor, z_var: torch.Tensor) -> distributions.Distribution:
+        kappa = 1.0 / torch.sqrt(1. + np.pi / 8 * z_var)
+        return distributions.Bernoulli(logits=kappa*z_mean)
+
+    def marginalize_samples(self, z_samples: torch.Tensor, batch_idx : int = 0) -> distributions.Distribution:
+        probs = torch.sigmoid(z_samples).mean(dim=batch_idx)
+        return distributions.Bernoulli(probs=probs)
+
+    def apply_sqrt_F(self, z: torch.Tensor) -> torch.Tensor:
+        p = torch.sigmoid(z)
+        L = torch.sqrt(p * (1 - p)) + 1e-8 # for stability
+        return L * z
+
+    def metric(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Computes 0-1 classification error
+        """
+        return ( (self.z >= 0) != y ).float()
+    
+class NormalMeanParamLayer(DistributionLayer):
+    """
+    Implements Normal RV parameterized by the mean. The variance is a parameter of the layer.
+    """
+    def __init__(self, init_log_variance : torch.Tensor = torch.zeros(1)) -> None:
+        super().__init__()
+        self.log_variance = nn.Parameter(init_log_variance)
+    
+    @property
+    def std_dev(self) -> torch.Tensor:
+        return torch.exp(0.5*self.log_variance)
+
+    @property
+    def var(self) -> torch.Tensor:
+        return torch.exp(self.log_variance)
+
+    def forward(self, z: torch.Tensor) -> distributions.Distribution:
+        return distributions.Independent(
+                    distributions.Normal(
+                        loc = z, 
+                        scale = self.std_dev.broadcast_to(z.size())
+                        ),
+                    reinterpreted_batch_ndims=1
+                )
+    
+    def marginalize_gaussian(self, z_mean: torch.Tensor, z_var: torch.Tensor) -> distributions.Distribution:
+        combined_std_dev = torch.sqrt(self.std_dev**2 + z_var)
+        return distributions.Independent(
+                distributions.Normal(loc=z_mean, scale=combined_std_dev), 
+                reinterpreted_batch_ndims=1
+            )
+
+    def marginalize_samples(self, z_samples: torch.Tensor, batch_idx: int = 0) -> distributions.Distribution:
+        combined_mean = z_samples.mean(batch_idx)
+        combined_std_dev = torch.sqrt(
+            (z_samples ** 2).mean(batch_idx)
+            - combined_mean ** 2
+            + self.var
+        )
+        return distributions.Independent(
+                distributions.Normal(loc=combined_mean, scale=combined_std_dev), 
+                reinterpreted_batch_ndims=1
+            )
+    
+    def apply_sqrt_F(self, z: torch.Tensor) -> torch.Tensor:
+        return z / self.std_dev
+
+    def metric(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return ((y - z)**2).sum(-1)
+
+
+class NormalMeanDiagVarParamLayer(DistributionLayer):
+    """
+    Implements Normal RV where both mean and log var are input as parameters
+    Assumes first half of z is mean, second half is log_var
+    Only performs Fisher computation around mean.
+    """
+    def _get_mean_logvar(self, z : torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        N = z.shape[-1]
+        assert N % 2 == 0
+        return z[...,:N//2], z[...,N//2:]
+
+    def forward(self, z: torch.Tensor) -> distributions.Distribution:
+        mean, logvar = self._get_mean_logvar(z)
+        return distributions.Independent(
+                    distributions.Normal(
+                        loc = mean, 
+                        scale = torch.exp(0.5*logvar)
+                        ),
+                    reinterpreted_batch_ndims=1
+                )
+    
+    def marginalize_gaussian(self, z_mean: torch.Tensor, z_var: torch.Tensor) -> distributions.Distribution:
+        mean_mean, logvar_mean = self._get_mean_logvar(z_mean)
+        mean_var, logvar_var = self._get_mean_logvar(z_var)
+
+        combined_std_dev = torch.sqrt(torch.exp(logvar_mean) + mean_var)
+        return distributions.Independent(
+                distributions.Normal(loc=mean_mean, scale=combined_std_dev), 
+                reinterpreted_batch_ndims=1
+            )
+
+    def marginalize_samples(self, z_samples: torch.Tensor, batch_idx: int = 0) -> distributions.Distribution:
+        mean_samples, logvar_samples = self._get_mean_logvar(z_samples)
+        var_mean = torch.exp(logvar_samples).mean(batch_idx)
+        combined_mean = mean_samples.mean(batch_idx)
+        combined_std_dev = torch.sqrt(
+            (z_samples ** 2).mean(batch_idx)
+            - combined_mean ** 2
+            + var_mean
+        )
+        return distributions.Independent(
+                distributions.Normal(loc=combined_mean, scale=combined_std_dev), 
+                reinterpreted_batch_ndims=1
+            )
+    
+    def apply_sqrt_F(self, z: torch.Tensor) -> torch.Tensor:
+        mean, logvar = self._get_mean_logvar(z)
+        return mean / torch.exp(0.5*logvar).detach()
+
+    def metric(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        mean, logvar = self._get_mean_logvar(z)
+        return ((y - mean)**2).sum(-1)
+
+
+class CategoricalLogitLayer(DistributionLayer):
+    """
+    Implements Categorical distribution parameterized by logits
+    """
+    def forward(self, z: torch.Tensor) -> distributions.Distribution:
+        return distributions.Categorical(logits = z)
+    
+    def marginalize_gaussian(self, z_mean: torch.Tensor, z_var: torch.Tensor) -> distributions.Distribution:
+        kappa = 1.0 / torch.sqrt(1. + np.pi / 8 * z_var)
+        return distributions.Categorical(logits=kappa*z_mean)
+
+    def marginalize_samples(self, z_samples: torch.Tensor, batch_idx : int = 0) -> distributions.Distribution:
+        probs = torch.softmax(z_samples, -1).mean(dim=batch_idx)
+        return distributions.Categorical(probs=probs)
+
+    def apply_sqrt_F(self, z: torch.Tensor) -> torch.Tensor:
+        p = torch.softmax(z, -1).detach()
+        z_bar = (p * z).sum(-1, keepdim=True)
+        return torch.sqrt(p) * ( z - z_bar )
+
+    def metric(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Computes 0-1 classification error
+        """
+        return (torch.argmax(z, dim=-1) != y).float()
 
 class ExtendedDistribution:
     """
