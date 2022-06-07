@@ -22,7 +22,6 @@ base_config = {
     "num_samples": None,  # sketch size T (T)
     "num_eigs": 10,  # low rank estimate to recover (k)
     "prior_type": "scalar",  # options are 'scalar' (isotropic prior), 'per_parameter', 'per_weight'
-    "prior_scale": 1., # initial prior scale
     "sketch_type": "gaussian",  # sketch type
     "offline_proj_dim": None,  # whether to subsample rows during offline computation
     "online_proj_dim": None,  # whether to project output down before taking gradients at test time
@@ -91,7 +90,6 @@ class SCOD(nn.Module):
         # ---------------------------
         # options for prior representation and computation
         self.prior_type = self.config["prior_type"]
-        self.init_log_prior_scale = math.log(self.config['prior_scale'])
         self.log_prior_scale = nn.Parameter(self._init_log_prior(), requires_grad=True)
 
         # --------------------------------
@@ -133,6 +131,9 @@ class SCOD(nn.Module):
             requires_grad=False,
         )
 
+        # rescaling factor
+        self.alpha = nn.Parameter( torch.zeros(1, device=self.device), requires_grad=False)
+
         # stores what prior scales were used in GGN computation
         self.GGN_sqrt_prior = nn.Parameter(copy(self.sqrt_prior), requires_grad=False)
         self.GGN_is_aligned = True
@@ -158,7 +159,7 @@ class SCOD(nn.Module):
             raise ValueError(
                 "prior_type must be one of (scalar, per_parameter, per_weight)"
             )
-        return self.init_log_prior_scale * torch.ones(n_prior_params, device=self.device)
+        return torch.zeros(n_prior_params, device=self.device)
 
     def _broadcast_to_n_weights(self, v: torch.Tensor) -> torch.Tensor:
         """Broadcasts a vector to be the length of self.n_weights
@@ -256,8 +257,8 @@ class SCOD(nn.Module):
 
         Assumes J is the jacobian already scaled by the sqrt prior covariance.
 
-        Returns diag( J ( I - U D U^T ) J^T )
-        where D = diag( eigs / (eigs + 1) )
+        Returns diag( J ( (1-alpha) I - U D U^T ) J^T )
+        where D = diag( eigs / (eigs + 1) - alpha)
 
         and U diag(eigs) U^T ~= G, the Gauss Newton matrix computed using gradients
         already scaled by the sqrt prior covariance
@@ -277,9 +278,9 @@ class SCOD(nn.Module):
         eigs = torch.clamp(self.GGN_eigs[-n_eigs:], min=0.0)
 
         if self.GGN_is_aligned:
-            scaling = eigs / (eigs + 1.0)
-            neg_term = torch.sqrt(scaling[None, :]) * (J @ basis)
-            neg_term = neg_term @ neg_term.T
+            scaling = eigs / (eigs + 1.0) - self.alpha
+            neg_term = J @ basis
+            neg_term = neg_term @ (scaling[:, None] * neg_term.T)
         else:
             # G = rescaling*U D (rescaling*U).T
             # the rescaling breaks the orthogonality of the basis, need to do matrix inversion
@@ -287,11 +288,11 @@ class SCOD(nn.Module):
                 self.sqrt_prior / self.GGN_sqrt_prior
             )
             basis = rescaling[:, None] * basis
-            inv_term = torch.linalg.inv(torch.diag_embed(1.0 / eigs) + basis.T @ basis)
+            inv_term = torch.linalg.inv(torch.diag_embed(1.0 / eigs - self.alpha) + basis.T @ basis)
             scaled_jac = J @ basis
             neg_term = scaled_jac @ inv_term @ scaled_jac.T
 
-        return JJT - neg_term
+        return (1-self.alpha)*JJT - neg_term
 
     def process_dataset(
         self,
@@ -362,14 +363,57 @@ class SCOD(nn.Module):
         del sqrt_C_T  # free memory @TODO: sketch could take output tensors to populate directly
         eigs, eigvs = sketch.eigs()
         del sketch
-        self.GGN_eigs.data = eigs[-self.num_eigs:].to(self.device)
+        self.GGN_eigs.data = torch.clamp_min( eigs[-self.num_eigs:], min=torch.zeros(1)).to(self.device)
         self.GGN_basis.data = eigvs[:,-self.num_eigs:].to(self.device)
         self.GGN_sqrt_prior.data = copy(self.sqrt_prior)
         self.GGN_is_aligned = True
 
+        # now loop over again to estimate alpha
+        print("Estimating alpha")
+        total_unmodeled_energy = 0.
+
+        for i, (inputs, labels) in tqdm(enumerate(dataloader), total=n_data):
+            inputs = inputs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            with autocast():
+                z = self.model(inputs)
+                dist = self.dist_constructor(z)
+                if self.metric_threshold is not None:
+                    metric = dist.metric(labels).mean()
+                    if metric > self.metric_threshold:
+                        continue
+
+                if self.use_empirical_fisher:
+                    # contribution of this datapoint is
+                    # C = J_l^T J_l, where J_l = d(-log p(y | x))/dw
+                    pre_jac_factor = -dist.validated_log_prob(labels)  # shape [1]
+                else:
+                    # contribution of this datapoint is
+                    # C = J_f^T L L^T J
+                    Lt_z = dist.apply_sqrt_F(z).mean(dim=0)  # L^\T theta
+                    # flatten
+                    pre_jac_factor = Lt_z.view(-1)  # shape [prod(event_shape)]
+
+                if self.use_random_proj:
+                    pre_jac_factor = random_subslice(
+                        pre_jac_factor, dim=0, k=self.offline_projection_dim, scale=True
+                    )
+
+            sqrt_C_T = self._get_weight_jacobian(
+                pre_jac_factor, scaled_by_prior=True
+            )  # shape ([T x N])
+
+            proj_sqrt_C_T = sqrt_C_T @ self.GGN_basis
+
+            total_unmodeled_energy += ( sqrt_C_T.sum()**2 - proj_sqrt_C_T.sum()**2 ).detach()
+        
+        print(total_unmodeled_energy.item())
+        self.alpha.data = total_unmodeled_energy / (self.n_weights - self.num_eigs + total_unmodeled_energy)
+
         self.configured.data = torch.ones(1, dtype=torch.bool)
 
-    def kernel_matrix(self, inputs, prior_only=True, n_eigs=None):
+    def _kernel_matrix(self, inputs, prior_only=True, n_eigs=None):
         """
         returns a kernel (gram) matrix for the set of inputs
 
@@ -389,7 +433,7 @@ class SCOD(nn.Module):
             jacs, n_eigs=n_eigs, prior_only=prior_only
         )  # (KD x KD)
 
-    def output_projection(self, output_size, T):
+    def _output_projection(self, output_size, T):
         if self.online_projection_type == "PCA":
             return self.online_proj_basis[:, -T:].detach()
         elif self.online_projection_type == "blocked":
@@ -420,9 +464,9 @@ class SCOD(nn.Module):
         where N is the batch dimension,
               input_dims... are the dimensions of a single input
 
-        returns
-            mu = model(inputs) list of N distribution objects
-            unc = hessian based uncertainty estimates shape (N), torch.Tensor
+        Returns
+            dists (list): list of N distribution objects, output of model.tensor
+            unc (torch.Tensor):  SCOD uncertainty estimates, shape (N)
         """
         self.log_prior_scale.data += math.log(prior_multiplier)
         if T is None:
@@ -449,7 +493,7 @@ class SCOD(nn.Module):
         proj_flat_z = flat_z
         if T is not None and T < flat_z.shape[-1]:
             # if projection dim is provided and less than original dim
-            P = self.output_projection(flat_z_shape, T)
+            P = self._output_projection(flat_z_shape, T)
             proj_flat_z = flat_z @ P
 
         unc = []
@@ -528,7 +572,7 @@ class SCOD(nn.Module):
                     for dist, label in zip(dists, labels):
                         loss += -dist.log_prob(
                             label
-                        ).mean()  # -dist.validated_log_prob(label).mean()
+                        ).mean()
 
                     loss /= len(dists)
 
@@ -590,7 +634,7 @@ class SCOD(nn.Module):
                     inputs = inputs.to(self.device, non_blocking=True)
                     labels = labels.to(self.device, non_blocking=True)
 
-                    K_dnn = self.kernel_matrix(inputs, prior_only=True)
+                    K_dnn = self._kernel_matrix(inputs, prior_only=True)
                     min_eig = torch.min(torch.abs(torch.linalg.eigvals(K_dnn)))
 
                     K_gp = GP_kernel(inputs).to(self.device, non_blocking=True)
