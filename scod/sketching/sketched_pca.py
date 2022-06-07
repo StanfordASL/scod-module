@@ -22,7 +22,7 @@ def low_rank_approx(Y, W, Psi_fn):
     """
     Q, _ = torch.linalg.qr(Y, "reduced")  # (N, k)
     U, T = torch.linalg.qr(Psi_fn(Q), "reduced")  # (l, k), (k, k)
-    X, _ = torch.triangular_solve(U.t() @ W, T)  # (k, N)
+    X = torch.linalg.solve_triangular(T, U.t() @ W, upper=True) # (k, N)
 
     return Q, X
 

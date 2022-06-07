@@ -64,7 +64,7 @@ class SCOD(nn.Module):
         self.dist_constructor = dist_constructor
 
         # extract device from model
-        self.device = next(model.parameters()).device
+        device = next(model.parameters()).device
 
         # extract parameters to consider in sketch - keep all that yield valid gradients
         if parameters is None:
@@ -90,7 +90,7 @@ class SCOD(nn.Module):
         # ---------------------------
         # options for prior representation and computation
         self.prior_type = self.config["prior_type"]
-        self.log_prior_scale = nn.Parameter(self._init_log_prior(), requires_grad=True)
+        self.log_prior_scale = nn.Parameter(self._init_log_prior(device), requires_grad=True)
 
         # --------------------------------
         # options for offline computation
@@ -123,11 +123,11 @@ class SCOD(nn.Module):
         # Parameters to be saved as part of self.state_dict() for easy reloading:
         # Low-rank approx of Gauss Newton, filled in by self.process_dataset
         self.GGN_eigs = nn.Parameter(
-            torch.zeros(self.num_eigs, device=self.device), requires_grad=False
+            torch.zeros(self.num_eigs, device=device), requires_grad=False
         )
 
         self.GGN_basis = nn.Parameter(
-            torch.zeros(self.n_weights, self.num_eigs, device=self.device),
+            torch.zeros(self.n_weights, self.num_eigs, device=device),
             requires_grad=False,
         )
 
@@ -137,7 +137,7 @@ class SCOD(nn.Module):
 
         self.hyperparameters = [self.log_prior_scale]
 
-    def _init_log_prior(self) -> torch.Tensor:
+    def _init_log_prior(self, device : torch.DeviceObjType) -> torch.Tensor:
         """Returns intial value of log_prior parameter, depending on self.prior_type
 
         Raises:
@@ -156,7 +156,7 @@ class SCOD(nn.Module):
             raise ValueError(
                 "prior_type must be one of (scalar, per_parameter, per_weight)"
             )
-        return torch.zeros(n_prior_params, device=self.device)
+        return torch.zeros(n_prior_params, device=device)
 
     def _broadcast_to_n_weights(self, v: torch.Tensor) -> torch.Tensor:
         """Broadcasts a vector to be the length of self.n_weights
@@ -304,26 +304,29 @@ class SCOD(nn.Module):
 
         dataset - torch dataset of (input, target) pairs
         """
+        # infer device from model:
+        device = next(self.model.parameters()).device
+
         # loop through data, one sample at a time
         print("computing basis")
         if dataloader_kwargs is None:
             dataloader_kwargs = {
                 "num_workers": 4,
             }
-            if self.device.type != "cpu":
+            if device.type != "cpu":
                 dataloader_kwargs["pin_memory"] = True
         dataloader_kwargs.update({"batch_size": 1})
 
         dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
         sketch = self.sketch_class(
-            N=self.n_weights, r=self.num_eigs, T=self.num_samples, device=self.device
+            N=self.n_weights, r=self.num_eigs, T=self.num_samples, device=device
         )
 
         n_data = len(dataloader)
         for i, (inputs, labels) in tqdm(enumerate(dataloader), total=n_data):
-            inputs = inputs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             with autocast():
                 z = self.model(inputs)
@@ -360,8 +363,8 @@ class SCOD(nn.Module):
         del sqrt_C_T  # free memory @TODO: sketch could take output tensors to populate directly
         eigs, eigvs = sketch.eigs()
         del sketch
-        self.GGN_eigs.data = torch.clamp_min( eigs[-self.num_eigs:], min=torch.zeros(1)).to(self.device)
-        self.GGN_basis.data = eigvs[:,-self.num_eigs:].to(self.device)
+        self.GGN_eigs.data = torch.clamp_min( eigs[-self.num_eigs:], min=torch.zeros(1)).to(device)
+        self.GGN_basis.data = eigvs[:,-self.num_eigs:].to(device)
         self.GGN_sqrt_prior.data = copy(self.sqrt_prior)
         self.GGN_is_aligned = True
 
@@ -387,21 +390,21 @@ class SCOD(nn.Module):
             jacs, n_eigs=n_eigs, prior_only=prior_only
         )  # (KD x KD)
 
-    def _output_projection(self, output_size, T):
+    def _output_projection(self, output_size, T, device):
         if self.online_projection_type == "PCA":
             return self.online_proj_basis[:, -T:].detach()
         elif self.online_projection_type == "blocked":
             P = torch.eq(
                 torch.floor(
-                    torch.arange(output_size, device=self.device)[:, None]
+                    torch.arange(output_size, device=device)[:, None]
                     / (output_size // T)
                 ),
-                torch.arange(T, device=self.device)[None, :],
+                torch.arange(T, device=device)[None, :],
             ).float()
             P /= torch.norm(P, dim=0, keepdim=True)
             return P
         else:
-            P = torch.randn(output_size, T, device=self.device)
+            P = torch.randn(output_size, T, device=device)
             P, _ = torch.linalg.qr(P, "reduced")
             return P
 
@@ -437,6 +440,7 @@ class SCOD(nn.Module):
             n_eigs = self.num_eigs
 
         N = inputs.shape[0]  # batch size
+        device = inputs.device # used to ensure compatibility of constructed tensors
 
         z = self.model(inputs)  # batch of outputs
         flat_z = z.view(N, -1)  # batch of flattened outputs
@@ -447,7 +451,7 @@ class SCOD(nn.Module):
         proj_flat_z = flat_z
         if T is not None and T < flat_z.shape[-1]:
             # if projection dim is provided and less than original dim
-            P = self._output_projection(flat_z_shape, T)
+            P = self._output_projection(flat_z_shape, T, device)
             proj_flat_z = flat_z @ P
 
         unc = []
@@ -491,6 +495,8 @@ class SCOD(nn.Module):
         tunes prior variance scale (eps) via SGD to minimize
         validation nll on a given dataset
         """
+        device = next(self.model.parameters()).device
+
         self.GGN_is_aligned = False
         if dataloader_kwargs is None:
             dataloader_kwargs = {
@@ -498,7 +504,7 @@ class SCOD(nn.Module):
                 "batch_size": 20,
                 "shuffle": True,
             }
-            if self.device.type != "cpu":
+            if device.type != "cpu":
                 dataloader_kwargs["pin_memory"] = True
 
         dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
@@ -514,8 +520,8 @@ class SCOD(nn.Module):
                 pbar2.refresh()
                 pbar2.reset(total=dataset_size)
                 for inputs, labels in dataloader:
-                    inputs = inputs.to(self.device, non_blocking=True)
-                    labels = labels.to(self.device, non_blocking=True)
+                    inputs = inputs.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
 
                     # zero the parameter gradients
                     optimizer.zero_grad()
@@ -560,6 +566,7 @@ class SCOD(nn.Module):
         difference between prior and a given GP
         GP_kernel should take in a batch of data and produce a gram matrix
         """
+        device = next(self.model.parameters()).device
         self.GGN_is_aligned = False
         if dataloader_kwargs is None:
             dataloader_kwargs = {
@@ -567,7 +574,7 @@ class SCOD(nn.Module):
                 "batch_size": 20,
                 "shuffle": True,
             }
-            if self.device.type != "cpu":
+            if device.type != "cpu":
                 dataloader_kwargs["pin_memory"] = True
 
         dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
@@ -585,13 +592,13 @@ class SCOD(nn.Module):
                 pbar2.refresh()
                 pbar2.reset(total=dataset_size)
                 for inputs, labels in dataloader:
-                    inputs = inputs.to(self.device, non_blocking=True)
-                    labels = labels.to(self.device, non_blocking=True)
+                    inputs = inputs.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
 
                     K_dnn = self._kernel_matrix(inputs, prior_only=True)
                     min_eig = torch.min(torch.abs(torch.linalg.eigvals(K_dnn)))
 
-                    K_gp = GP_kernel(inputs).to(self.device, non_blocking=True)
+                    K_gp = GP_kernel(inputs).to(device, non_blocking=True)
                     err = None
                     if GP_mu is not None:
                         mu_dnn = self.model(inputs)
