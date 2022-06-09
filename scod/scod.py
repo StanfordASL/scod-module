@@ -286,6 +286,44 @@ class SCOD(nn.Module):
 
         return JJT - neg_term
 
+    def _kernel_matrix(self, inputs, prior_only=True, n_eigs=None):
+        """
+        returns a kernel (gram) matrix for the set of inputs
+
+        returns a matrix of size: [KD x KD] where inputs is [X, d]
+        """
+        N = inputs.shape[0]  # batch size
+
+        z = self.model(inputs)  # batch of outputs
+        flat_z = z.view(N, -1)  # batch of flattened outputs
+        jacs = []
+        for j in range(N):
+            J = self._get_weight_jacobian(flat_z[j, :], scaled_by_prior=True)
+            jacs.append(J)
+
+        jacs = torch.cat(jacs, dim=0)  # (KD x N)
+        return self._predictive_var(
+            jacs, n_eigs=n_eigs, prior_only=prior_only
+        )  # (KD x KD)
+
+    def _output_projection(self, output_size, T, device):
+        if self.online_projection_type == "PCA":
+            return self.online_proj_basis[:, -T:].detach()
+        elif self.online_projection_type == "blocked":
+            P = torch.eq(
+                torch.floor(
+                    torch.arange(output_size, device=device)[:, None]
+                    / (output_size // T)
+                ),
+                torch.arange(T, device=device)[None, :],
+            ).float()
+            P /= torch.norm(P, dim=0, keepdim=True)
+            return P
+        else:
+            P = torch.randn(output_size, T, device=device)
+            P, _ = torch.linalg.qr(P, "reduced")
+            return P
+
     def process_dataset(
         self,
         dataset: torch.utils.data.Dataset,
@@ -366,43 +404,58 @@ class SCOD(nn.Module):
 
         self.configured.data = torch.ones(1, dtype=torch.bool)
 
-    def _kernel_matrix(self, inputs, prior_only=True, n_eigs=None):
+    def local_kl_div(self, 
+        inputs: torch.Tensor,
+        dist_layer: DistributionLayer,
+        use_prior: bool = False,
+        n_eigs: Optional[int] = None,
+        prior_multiplier: float = 1.,
+    ) -> torch.Tensor:
         """
-        returns a kernel (gram) matrix for the set of inputs
+        Outputs E_{w \sim p(w | D)}[ KL(p(w), p(w^*)) ],
+        the expected KL divergence between p(w) and p(w^*) when w is sampled from the posterior.
 
-        returns a matrix of size: [KD x KD] where inputs is [X, d]
+        Args:
+            inputs (torch.Tensor): _description_
+            use_prior (bool, optional): _description_. Defaults to False.
+            n_eigs (Optional[int], optional): _description_. Defaults to None.
+            prior_multiplier (float, optional): _description_. Defaults to 1..
+
+        Returns:
+            torch.Tensor: _description_
         """
+        self.log_prior_scale.data += math.log(prior_multiplier)
+
+        if n_eigs is None:
+            n_eigs = self.num_eigs
+
+        basis = self.GGN_basis[:, -n_eigs:]
+        eigs = torch.clamp(self.GGN_eigs[-n_eigs:], min=0.0)
+
+        scaling = torch.sqrt( eigs / (eigs + 1.0) )
+
         N = inputs.shape[0]  # batch size
 
-        z = self.model(inputs)  # batch of outputs
-        flat_z = z.view(N, -1)  # batch of flattened outputs
-        jacs = []
+        z_mean = self.model(inputs)  # batch of outputs
+        Lt_z = dist_layer.apply_sqrt_F(z_mean)
+        flat_Ltz = Lt_z.view(N, -1) # batch of flattened fisher scaled outputs        
+
+        kl_divs = []
         for j in range(N):
-            J = self._get_weight_jacobian(flat_z[j, :], scaled_by_prior=True)
-            jacs.append(J)
+            Lt_Jj = self._get_weight_jacobian(
+                flat_Ltz[j, :], scaled_by_prior=True
+            )
+            
+            pos_term = (Lt_Jj**2).sum()
+            neg_term = ( ( (Lt_Jj @ basis) * scaling[None,:] )**2 ).sum()
 
-        jacs = torch.cat(jacs, dim=0)  # (KD x N)
-        return self._predictive_var(
-            jacs, n_eigs=n_eigs, prior_only=prior_only
-        )  # (KD x KD)
+            kl_divs.append( pos_term - neg_term )
 
-    def _output_projection(self, output_size, T, device):
-        if self.online_projection_type == "PCA":
-            return self.online_proj_basis[:, -T:].detach()
-        elif self.online_projection_type == "blocked":
-            P = torch.eq(
-                torch.floor(
-                    torch.arange(output_size, device=device)[:, None]
-                    / (output_size // T)
-                ),
-                torch.arange(T, device=device)[None, :],
-            ).float()
-            P /= torch.norm(P, dim=0, keepdim=True)
-            return P
-        else:
-            P = torch.randn(output_size, T, device=device)
-            P, _ = torch.linalg.qr(P, "reduced")
-            return P
+        kl_divs = torch.stack(kl_divs)
+
+        self.log_prior_scale.data -= math.log(prior_multiplier)
+
+        return kl_divs
 
     def forward(
         self,
