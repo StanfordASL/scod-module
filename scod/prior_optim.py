@@ -108,10 +108,7 @@ def optimize_prior_scale_by_GP_kernel(
 
     grad_counter = 0
     with tqdm(total=num_epochs, position=0) as pbar:
-        pbar2 = tqdm(total=dataset_size, position=1)
         for epoch in range(num_epochs):
-            pbar2.refresh()
-            pbar2.reset(total=dataset_size)
             for inputs, labels in dataloader:
                 inputs = inputs.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
@@ -146,11 +143,6 @@ def optimize_prior_scale_by_GP_kernel(
                     optimizer.step()
                     # zero the parameter gradients
                     optimizer.zero_grad()
-
-                pbar2.set_postfix(
-                    batch_loss=loss.item(), eps=scod_model.sqrt_prior.mean().item()
-                )
-                pbar2.update(inputs.shape[0])
 
                 losses.append(loss.item())
                 min_eigs.append(min_eig.item())
