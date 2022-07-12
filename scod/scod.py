@@ -46,6 +46,16 @@ class SCOD(nn.Module):
             model (nn.Module): Pre-trained DNN
             args (dict, optional):
                 Configuration parameters for SCOD. If None, uses default settings. Defaults to None.
+                Valid parameters, and their defaults, are given below:
+                    "num_eigs": 10,  # low rank estimate to recover (k)
+                    "num_samples": None,  # sketch size T (T), if None, uses 
+                    "prior_type": "scalar",  # options are 'scalar' (isotropic prior), 'per_parameter', 'per_weight'
+                    "sketch_type": "gaussian",  # sketch type
+                    "offline_proj_dim": None,  # whether to subsample rows during offline computation
+                    "online_proj_dim": None,  # whether to project output down before taking gradients at test time
+                    "online_proj_type": "gaussian",  # how to do output projection
+                    "metric_threshold": None, # if not None, expects a float indicating whether to ignore a training point
+
             parameters (nn.ParameterList, optional):
                 The parameters of model to consider when computing approximate Bayesian posterior.
                 If None, uses all model.parameters() for which requires_grad is True.  Defaults to None.
@@ -525,3 +535,31 @@ class SCOD(nn.Module):
 
         self.log_prior_scale.data -= math.log(prior_multiplier)
         return z_mean, z_var
+
+
+class OodDetector(nn.Module):
+    def __init__(self, scod_model : SCOD, dist_layer : DistributionLayer, metric : str = "entropy"):
+        super().__init__()
+        self.scod_model = scod_model
+        self.metric = metric
+        self.dist_layer = dist_layer
+
+    def _entropy_signal(self, x):
+        z_mean, z_var = self.scod_model(x)
+        dist = self.dist_layer.marginalize_gaussian(z_mean, z_var)
+        return dist.entropy()
+
+    def _local_kl_div(self, x):
+        return self.scod_model.local_kl_div(x, self.dist_layer)
+
+    def _trace_of_var(self, x):
+        z_mean, z_var = self.scod_model(x)
+        return z_var.view(z_var.shape[0], -1).sum(-1)
+
+    def forward(self, x : torch.Tensor):
+        if self.metric == "entropy":
+            return self._entropy_signal(x)
+        elif self.metric == "local_kl":
+            return self._local_kl_div(x)
+        elif self.metric == "var":
+            return self._trace_of_var(x)
