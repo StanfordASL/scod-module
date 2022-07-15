@@ -5,7 +5,7 @@ This repository implements SCOD, a mechanism to take any pre-trained neural netw
 
 
 This repo implements SCOD as a wrapper to an existing pytorch module. For example, if `model` is a pytorch model, then we can construct a SCOD wrapper by calling
-```
+```python
 from scod import SCOD
 
 # model is a torch.nn.Module that has already been trained
@@ -15,7 +15,7 @@ scod_model = SCOD(model)
 
 Offline, SCOD processes a set of training data. SCOD assumes a probabilistic treatment of the model output, i.e. if `z = model(x)`, then z is the parameter which defines a distribution over the targets `y`. This map from `z` to a probability distribution is represented in the framework through a `scod.distributions.DistributionLayer` object, which acts like a torch network layer, but outputs a `torch.distributions.Distribution` object rather than a tensor. SCOD provides DistributionLayers representing common choices for regression and classification tasks, e.g. interpreting `z` as logits specifying a categorical distribution over the target classes `y`.
 
-```
+```python
 # assuming a classification problem
 from scod.distributions import CategoricalLogitLayer
 
@@ -28,7 +28,7 @@ scod_model.process_dataset(dataset, dist_layer)
 
 After processing the training data, SCOD can make predictions on test data. Instead of outputing a point estimate of `z`, SCOD instead outputs a Gaussian predictive distribution over `z`, specified by a mean and diagonal variance.
 
-```
+```python
 # x_test is a batch of test points, shape (N, d_x)
 
 z_mean, z_var = scod_model(x_test)
@@ -37,7 +37,7 @@ z_mean, z_var = scod_model(x_test)
 
 To use these predictions in the context of OOD detection, we can create a `scod.OodDetector` object, which uses the Gaussian predictions on `z` to estimate the overall entropy of the marginal distribution on the targets `y`, a scalar quantity which can be thresholded to separate in-distribution from out-of-distribution data.
 
-```
+```python
 from scod import OodDetector
 
 ood_detector = OodDetector(scod_model, dist_layer)
